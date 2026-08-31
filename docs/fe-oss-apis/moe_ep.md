@@ -458,17 +458,19 @@ Run host-side and local tests:
 ```bash
 python -m pytest \
   test/python/moe_ep/test_moe_ep_cutedsl.py \
-  test/python/moe_ep/test_moe_ep_forward.py \
-  test/python/moe_ep/test_moe_ep_backward.py \
+  test/python/moe_ep/test_moe_ep_contract.py \
+  test/python/moe_ep/test_moe_ep_execution.py \
   -m L0
 ```
 
-Run SM107 single-node distributed tests from an exclusive GPU allocation:
+The contract suite contains regression and rejection coverage rather than
+copy-ready examples; use this page for canonical API usage. Run SM107
+single-GPU and single-node distributed tests from an exclusive GPU allocation:
 
 ```bash
 python -m pytest \
-  test/python/moe_ep/test_moe_ep_forward.py \
-  test/python/moe_ep/test_moe_ep_backward.py \
+  test/python/moe_ep/test_moe_ep_execution.py \
+  test/python/moe_ep/test_moe_ep_distributed.py \
   -m L1
 ```
 

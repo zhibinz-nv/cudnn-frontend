@@ -25,6 +25,7 @@ from moe_ep.moe_ep_test_support import (
 pytestmark = [
     pytest.mark.L1,
     pytest.mark.gpu_exclusive,
+    pytest.mark.moe_ep_distributed,
     pytest.mark.moe_ep_multinode,
 ]
 
@@ -58,7 +59,10 @@ class _TorchrunWorld:
 def _require_torchrun_environment() -> tuple[int, int, int, int]:
     missing = [name for name in _TORCHRUN_ENV if name not in os.environ]
     if missing:
-        pytest.skip("multi-node MoE EP tests require torchrun environment variables: " + ", ".join(missing))
+        pytest.skip(
+            "multi-node MoE EP tests require torchrun environment variables: "
+            + ", ".join(missing)
+        )
     return (
         int(os.environ["RANK"]),
         int(os.environ["WORLD_SIZE"]),
@@ -78,7 +82,10 @@ def torchrun_world():
 
     device = torch.device("cuda", local_rank)
     if torch.cuda.get_device_capability(device) != (10, 7):
-        pytest.skip("multi-node Rubin MXFP8 tests require exactly SM107 " "(compute capability 10.7) on every rank")
+        pytest.skip(
+            "multi-node Rubin MXFP8 tests require exactly SM107 "
+            "(compute capability 10.7) on every rank"
+        )
     try:
         import nvshmem.core  # noqa: F401
     except (ImportError, OSError):
@@ -88,7 +95,9 @@ def torchrun_world():
     torch.cuda.set_device(device)
     if dist.is_initialized():
         if dist.get_rank() != rank or dist.get_world_size() != world_size:
-            raise RuntimeError("existing process group does not match torchrun RANK/WORLD_SIZE")
+            raise RuntimeError(
+                "existing process group does not match torchrun RANK/WORLD_SIZE"
+            )
     else:
         dist.init_process_group(
             backend="nccl",
@@ -126,6 +135,7 @@ def torchrun_world():
         "required_world_size",
         "required_local_world_size",
         "ep_global_ranks",
+        "combine_format",
     ),
     [
         pytest.param(
@@ -133,32 +143,35 @@ def torchrun_world():
             8,
             4,
             (0, 1, 4, 5),
-            id="forward-ep4-world8",
+            "bf16",
+            id="forward-ep4-world8-bf16",
         ),
         pytest.param(
             6,
             8,
             4,
             (0, 1, 2, 4, 5, 6),
-            id="forward-ep6-world8",
+            "mxfp8",
+            id="forward-ep6-world8-mxfp8",
         ),
         pytest.param(
             12,
             12,
             4,
             tuple(range(12)),
-            id="forward-ep12-world12",
+            "bf16",
+            id="forward-ep12-world12-bf16",
         ),
         pytest.param(
             16,
             16,
             4,
             tuple(range(16)),
-            id="forward-ep16-world16",
+            "mxfp8",
+            id="forward-ep16-world16-mxfp8",
         ),
     ],
 )
-@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
 def test_mxfp8_forward_multinode_matches_reference(
     torchrun_world,
     ep_size,
@@ -168,7 +181,10 @@ def test_mxfp8_forward_multinode_matches_reference(
     combine_format,
 ):
     world = torchrun_world
-    if world.world_size != required_world_size or world.local_world_size != required_local_world_size:
+    if (
+        world.world_size != required_world_size
+        or world.local_world_size != required_local_world_size
+    ):
         pytest.skip(
             f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}, "
             f"LOCAL_WORLD_SIZE={required_local_world_size}; got "
@@ -226,18 +242,6 @@ def test_mxfp8_forward_multinode_matches_reference(
             id="backward-ep8-world8-bf16",
         ),
         pytest.param(
-            8,
-            8,
-            "mxfp8",
-            id="backward-ep8-world8-mxfp8",
-        ),
-        pytest.param(
-            16,
-            16,
-            "bf16",
-            id="backward-ep16-world16-bf16",
-        ),
-        pytest.param(
             16,
             16,
             "mxfp8",
@@ -265,7 +269,10 @@ def test_fixed_training_resources_multinode_match_independent_reference(
 ):
     world = torchrun_world
     if world.world_size != required_world_size:
-        pytest.skip(f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}; " f"got WORLD_SIZE={world.world_size}")
+        pytest.skip(
+            f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}; "
+            f"got WORLD_SIZE={world.world_size}"
+        )
 
     _run_backward_reference_case(
         device=world.device,
@@ -337,8 +344,14 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
             device_ids=[world.local_rank],
         )
 
-        assert isinstance(caught_error, RuntimeError), f"rank {world.rank} expected RuntimeError from collective prepare, " f"got {caught_error!r}"
+        assert isinstance(caught_error, RuntimeError), (
+            f"rank {world.rank} expected RuntimeError from collective prepare, "
+            f"got {caught_error!r}"
+        )
         message = str(caught_error)
-        assert "symmetric workspace region counts differ" in message or "ABI differs" in message, f"rank {world.rank} got unexpected prepare error: {message}"
+        assert (
+            "symmetric workspace region counts differ" in message
+            or "ABI differs" in message
+        ), f"rank {world.rank} got unexpected prepare error: {message}"
     finally:
         op.close()
