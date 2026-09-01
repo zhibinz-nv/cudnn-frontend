@@ -17,13 +17,17 @@ from ......helpers.device_workspace import DeviceWorkspace
 from ......helpers.smem_workspace import SmemWorkspace
 from ......helpers.utils import ceil_div, round_up
 from ......quant_def import CombineFormat, QuantKind
-from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
+from ......communication.nvlink_domain.token_comm_deterministic import (
+    TokenCommDeterministic,
+)
 from ..topk_reduce import TopkReduce
 from ..fwd_glu.glu_mxfp8_col_requant import Mxfp8ColRequant
 from .dglu_mxfp8_fc12_kernel import Sm107Mxfp8DgluDfc21Kernel
 
-
-_AB_DTYPE_TO_QUANT_KIND = {cutlass.Float8E4M3FN: QuantKind.mxfp8_e4m3, cutlass.Float8E5M2: QuantKind.mxfp8_e5m2}
+_AB_DTYPE_TO_QUANT_KIND = {
+    cutlass.Float8E4M3FN: QuantKind.mxfp8_e4m3,
+    cutlass.Float8E5M2: QuantKind.mxfp8_e5m2,
+}
 _QUANT_KIND_TO_AB_DTYPE = {str(k): d for d, k in _AB_DTYPE_TO_QUANT_KIND.items()}
 
 # TVM-FFI export symbol for the AOT-compiled callable.
@@ -112,18 +116,30 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         """Compile against fake (metadata-only) inputs; ``out_path=None`` returns the in-memory callable."""
         import math
 
-        from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_ptr
+        from cutlass.cute.runtime import (
+            make_fake_compact_tensor,
+            make_fake_stream,
+            make_ptr,
+        )
         from cutlass.cute.typing import AddressSpace, sym_int64
         from cutlass.cutlass_dsl import Int32, Int64
 
-        from ......communication.nvlink_domain.symmetric_buffer import SymmetricBufferHost
+        from ......communication.nvlink_domain.symmetric_buffer import (
+            SymmetricBufferHost,
+        )
 
         def fake_tensor(dtype, shape, stride_order, dynamic_axes, alignment):
             extents = tuple(
-                sym_int64(divisibility=math.gcd(int(extent), 128)) if axis in dynamic_axes else int(extent)
+                (
+                    sym_int64(divisibility=math.gcd(int(extent), 128))
+                    if axis in dynamic_axes
+                    else int(extent)
+                )
                 for axis, extent in enumerate(shape)
             )
-            return make_fake_compact_tensor(dtype, extents, stride_order=stride_order, assumed_align=alignment)
+            return make_fake_compact_tensor(
+                dtype, extents, stride_order=stride_order, assumed_align=alignment
+            )
 
         tokens = self.max_tokens_per_rank
         hidden = self.hidden
@@ -140,24 +156,58 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
         fake_arguments = dict(
             grad_out=fake_tensor(activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
-            grad_out_sf=fake_tensor(sf_dtype, (tokens, self.token_comm.activation_sf_hidden_padded), (1, 0), {0}, 16),
-            topk_idx=fake_tensor(cutlass.Int64, (tokens, self.num_topk), (1, 0), {0}, 16),
-            topk_weights=fake_tensor(cutlass.Float32, (tokens, self.num_topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(self.ab_dtype, (experts, hidden, inter_half), (2, 0, 1), {0, 2}, 16),
-            fc1_weight_sf=fake_tensor(sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
-            fc2_weight=fake_tensor(self.ab_dtype, (experts, gate_up, hidden), (2, 0, 1), {0, 2}, 16),
-            fc2_weight_sf=fake_tensor(sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
+            grad_out_sf=fake_tensor(
+                sf_dtype,
+                (tokens, self.token_comm.activation_sf_hidden_padded),
+                (1, 0),
+                {0},
+                16,
+            ),
+            topk_idx=fake_tensor(
+                cutlass.Int32, (tokens, self.num_topk), (1, 0), {0}, 16
+            ),
+            topk_weights=fake_tensor(
+                cutlass.Float32, (tokens, self.num_topk), (1, 0), {0}, 4
+            ),
+            fc1_weight=fake_tensor(
+                self.ab_dtype, (experts, hidden, inter_half), (2, 0, 1), {0, 2}, 16
+            ),
+            fc1_weight_sf=fake_tensor(
+                sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16
+            ),
+            fc2_weight=fake_tensor(
+                self.ab_dtype, (experts, gate_up, hidden), (2, 0, 1), {0, 2}, 16
+            ),
+            fc2_weight_sf=fake_tensor(
+                sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16
+            ),
             beta=fake_tensor(cutlass.Float32, (experts,), (0,), {0}, 4),
-            fc1_preact=fake_tensor(cutlass.BFloat16, self.get_fc1_preact_shape(), (1, 0), set(), 128),
-            output_activation=fake_tensor(cutlass.BFloat16, (tokens, hidden), (1, 0), {0}, 16),
+            fc1_preact=fake_tensor(
+                cutlass.BFloat16, self.get_fc1_preact_shape(), (1, 0), set(), 128
+            ),
+            output_activation=fake_tensor(
+                cutlass.BFloat16, (tokens, hidden), (1, 0), {0}, 16
+            ),
             overflow_flag=fake_tensor(cutlass.Int32, (1,), (0,), set(), 4),
             dprob=fake_tensor(cutlass.Float32, aux_shapes["dprob"], (1, 0), {0}, 16),
-            fc1_recompute=fake_tensor(self.ab_dtype, aux_shapes["fc1_recompute"], (1, 0), set(), 128),
-            fc1_recompute_sf=fake_tensor(sf_dtype, aux_shapes["fc1_recompute_sf"], (1, 0), set(), 128),
-            fc1_col_output=fake_tensor(self.ab_dtype, aux_shapes["fc1_col_output"], (1, 0), set(), 128),
-            fc1_col_output_sf=fake_tensor(sf_dtype, aux_shapes["fc1_col_output_sf"], (1, 0), set(), 128),
-            local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
-            shared_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
+            fc1_recompute=fake_tensor(
+                self.ab_dtype, aux_shapes["fc1_recompute"], (1, 0), set(), 128
+            ),
+            fc1_recompute_sf=fake_tensor(
+                sf_dtype, aux_shapes["fc1_recompute_sf"], (1, 0), set(), 128
+            ),
+            fc1_col_output=fake_tensor(
+                self.ab_dtype, aux_shapes["fc1_col_output"], (1, 0), set(), 128
+            ),
+            fc1_col_output_sf=fake_tensor(
+                sf_dtype, aux_shapes["fc1_col_output_sf"], (1, 0), set(), 128
+            ),
+            local_workspace=make_ptr(
+                cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128
+            ),
+            shared_workspace=make_ptr(
+                cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128
+            ),
             peer_rank_ptr_mapper_host=SymmetricBufferHost(
                 base_address=Int64(0),
                 offsets=tuple(Int64(0) for _ in range(self.world_size)),
@@ -176,7 +226,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
             return compiled
-        compiled.export_to_c(out_path, function_name=_aot_symbol_prefix, export_only_tvm_ffi_symbols=True)
+        compiled.export_to_c(
+            out_path, function_name=_aot_symbol_prefix, export_only_tvm_ffi_symbols=True
+        )
         return out_path
 
     @staticmethod
@@ -213,7 +265,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         launch_cluster_count: int,
         drop_on_overflow: bool,
         fc2_in_kernel_topk_reduce: bool = False,
-        token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
+        token_back_mode: Literal[
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps"
+        ] = "epi_warps",
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
         combine_format: Optional[CombineFormat] = None,
@@ -226,13 +280,19 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     ) -> "Sm107MegaMoEMxfp8DgluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
-            raise NotImplementedError("Sm107MegaMoEMxfp8DgluKernel requires a static_expert_shape.")
+            raise NotImplementedError(
+                "Sm107MegaMoEMxfp8DgluKernel requires a static_expert_shape."
+            )
         if hidden != static_expert_shape[2]:
-            raise ValueError(f"hidden ({hidden}) must equal static_expert_shape[2] ({static_expert_shape[2]}).")
+            raise ValueError(
+                f"hidden ({hidden}) must equal static_expert_shape[2] ({static_expert_shape[2]})."
+            )
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
         num_experts_per_rank, intermediate_gateup, _hidden = static_expert_shape
-        combine_format = CombineFormat.parse("bf16" if combine_format is None else str(combine_format))
+        combine_format = CombineFormat.parse(
+            "bf16" if combine_format is None else str(combine_format)
+        )
         problem_desc = ProblemDesc(
             {
                 "expert_count": world_size * num_experts_per_rank,
@@ -266,7 +326,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "drop_on_overflow": drop_on_overflow,
                 "fc2_in_kernel_topk_reduce": fc2_in_kernel_topk_reduce,
                 "token_back_mode": token_back_mode,
-                "epi_flag_batch": tuple(epi_flag_batch) if epi_flag_batch is not None else (1, 1),
+                "epi_flag_batch": (
+                    tuple(epi_flag_batch) if epi_flag_batch is not None else (1, 1)
+                ),
                 "flag_batch": flag_batch,
                 "act_func": act_func,
                 "dfc2_recompute": dfc2_recompute,
@@ -286,7 +348,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         num_topk = problem_desc["topk"]
         max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         max_recv_size_per_rank = min(
-            problem_desc["max_recv_size_per_rank"], world_size * max_tokens_per_rank * num_topk
+            problem_desc["max_recv_size_per_rank"],
+            world_size * max_tokens_per_rank * num_topk,
         )
         hidden = problem_desc["hidden_size"]
         combine_format = problem_desc["combine_format"]
@@ -324,16 +387,26 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.num_ctas_grad_y2_col_quant = impl_desc["num_ctas_grad_y2_col_quant"]
 
         if hidden != static_expert_shape[2]:
-            raise ValueError(f"hidden ({hidden}) must equal static_expert_shape[2] ({static_expert_shape[2]}).")
+            raise ValueError(
+                f"hidden ({hidden}) must equal static_expert_shape[2] ({static_expert_shape[2]})."
+            )
         token_back_by_dispatch = token_back_mode != "epi_warps"
-        combine_format = CombineFormat.parse("bf16" if combine_format is None else str(combine_format))
+        combine_format = CombineFormat.parse(
+            "bf16" if combine_format is None else str(combine_format)
+        )
         # in-kernel topk reduce only conflicts with a QUANTIZED combine (no per-topk
         # reduced-plane accumulation for quantized).  It DOES work with the
         # standalone/reuse_dispatch token-back modes (the token_comm token_back path
         # honours token_back_reduce_topk), so those are allowed (mirrors the legacy).
         if fc2_in_kernel_topk_reduce and combine_format.is_quantized:
-            raise ValueError("fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine.")
-        if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
+            raise ValueError(
+                "fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine."
+            )
+        if token_back_mode not in (
+            "epi_warps",
+            "standalone_warps",
+            "reuse_dispatch_warps",
+        ):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
@@ -380,9 +453,15 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # sync_threads() in kernel_tail deadlocks (M09/M10/M14/M15 hang).  epi_warps is
         # unaffected (it peer-writes grad_x directly and never reads fc2_done).
         self.token_back_by_dispatch = token_back_by_dispatch
-        self.token_back_standalone = token_back_by_dispatch and token_back_mode == "standalone_warps"
-        self.token_back_warp_id = (12, 13, 14, 15) if self.token_back_standalone else None
-        num_token_back_warps = len(self.token_back_warp_id) if self.token_back_standalone else 0
+        self.token_back_standalone = (
+            token_back_by_dispatch and token_back_mode == "standalone_warps"
+        )
+        self.token_back_warp_id = (
+            (12, 13, 14, 15) if self.token_back_standalone else None
+        )
+        num_token_back_warps = (
+            len(self.token_back_warp_id) if self.token_back_standalone else 0
+        )
         self.c_load_warp_id = 16 if self.token_back_standalone else 12
 
         # Register re-balance for the mega warp layout.  The base kernel sizes
@@ -419,7 +498,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.intermediate_gateup = self.intermediate_downproj * 2
         self.num_total_experts = world_size * self.num_experts_per_rank
         self.reduce_topk_in_kernel = fc2_in_kernel_topk_reduce
-        self.token_back_schedule_mode = load_balance_mode if load_balance_mode == "atomic_counter" else "static"
+        self.token_back_schedule_mode = (
+            load_balance_mode if load_balance_mode == "atomic_counter" else "static"
+        )
 
         # --- next Router-push token communication component. ---
         # dGLU dispatches raw grad_out tokens + the per-token routing prob (topk score)
@@ -430,7 +511,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         cluster_m, cluster_n = self.cluster_shape_mn
         tokens_per_fc1_ready_slot = cta_tile_m * cluster_m
         hidden_per_fc2_cluster_tile = cta_tile_m * cluster_m
-        fc2_done_signals_per_token_tile = ceil_div(hidden, hidden_per_fc2_cluster_tile) * cluster_m * cluster_n
+        fc2_done_signals_per_token_tile = (
+            ceil_div(hidden, hidden_per_fc2_cluster_tile) * cluster_m * cluster_n
+        )
         promised_launchable_sm_count = launch_cluster_count * cluster_m * cluster_n
         quant_kind = _AB_DTYPE_TO_QUANT_KIND[ab_dtype]
         tc_problem_desc = ProblemDesc(
@@ -474,12 +557,19 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # separately-allocated SMEM is reservable by ``_smem_misc_budget_bytes``.
         _ec, _ig, _hd = static_expert_shape
         self._build_scheduler(
-            expert_cnt=_ec, intermediate_gateup=_ig, hidden_dim=_hd, launch_cluster_count=launch_cluster_count
+            expert_cnt=_ec,
+            intermediate_gateup=_ig,
+            hidden_dim=_hd,
+            launch_cluster_count=launch_cluster_count,
         )
         self._sched_smem_bytes = self.sched_smem_ws.total_bytes
 
         # --- Post-kernel top-k reduction (skipped under in-kernel reduce). ---
-        self._topk_reduce = None if fc2_in_kernel_topk_reduce else TopkReduce(hidden, num_topk, combine_format)
+        self._topk_reduce = (
+            None
+            if fc2_in_kernel_topk_reduce
+            else TopkReduce(hidden, num_topk, combine_format)
+        )
 
         # --- Device workspace (next model): dGLU pools + token_comm regions. ---
         self._mega_device_workspace = self._build_megamoe_device_workspace()
@@ -512,7 +602,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # Optional post-kernel token-axis MXFP8 requantization of the routed
         # grad_out pool consumed as the dfc2 input.
         if self.enable_grad_y2_col_quant:
-            col_quant_type = "mxfp8_e4m3" if ab_dtype is cutlass.Float8E4M3FN else "mxfp8_e5m2"
+            col_quant_type = (
+                "mxfp8_e4m3" if ab_dtype is cutlass.Float8E4M3FN else "mxfp8_e5m2"
+            )
             self.grad_y2_col_quant = Mxfp8ColRequant(
                 hidden=self.hidden,
                 num_experts=self.num_experts_per_rank,
@@ -531,7 +623,12 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     def _smem_misc_budget_bytes(self) -> int:
         """Reserve the token_comm transport + scheduler SMEM on top of the base misc budget."""
         _sched = getattr(self, "_sched_smem_bytes", 0)
-        return super()._smem_misc_budget_bytes() + self._token_comm_smem_bytes + _sched + self._SMEM_ALLOC_MARGIN
+        return (
+            super()._smem_misc_budget_bytes()
+            + self._token_comm_smem_bytes
+            + _sched
+            + self._SMEM_ALLOC_MARGIN
+        )
 
     def get_aux_output_shapes(self) -> dict:
         """Shapes of the fixed-ABI dFC2 auxiliary outputs.
@@ -545,9 +642,15 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         return {
             "dprob": (self.max_tokens_per_rank, self.num_topk),
             "fc1_recompute": (data_token_capacity, self.intermediate_downproj),
-            "fc1_recompute_sf": (round_up(self.intermediate_downproj, 128), column_sf_row_count),
+            "fc1_recompute_sf": (
+                round_up(self.intermediate_downproj, 128),
+                column_sf_row_count,
+            ),
             "fc1_col_output": (data_token_capacity, self.intermediate_gateup),
-            "fc1_col_output_sf": (round_up(self.intermediate_gateup, 128), column_sf_row_count),
+            "fc1_col_output_sf": (
+                round_up(self.intermediate_gateup, 128),
+                column_sf_row_count,
+            ),
             "grad_y2": (data_token_capacity, self.hidden),
             "grad_y2_sf": (sf_token_capacity * (self.hidden // self.sf_vec_size),),
         }
@@ -557,7 +660,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         return (self.token_comm.worst_case_token_count, self.intermediate_gateup)
 
     @cute.jit
-    def _validate_fixed_pool_tensor(self, tensor: cute.Tensor, dtype, expected_shape, expected_stride=None) -> None:
+    def _validate_fixed_pool_tensor(
+        self, tensor: cute.Tensor, dtype, expected_shape, expected_stride=None
+    ) -> None:
         if cutlass.const_expr(tensor.element_type is not dtype):
             raise TypeError("pool-domain tensor has an unexpected element type.")
         if cutlass.const_expr(cute.rank(tensor.layout) != 2):
@@ -568,9 +673,13 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             or tensor.shape[0] != expected_shape[0]
             or tensor.shape[1] != expected_shape[1]
         ):
-            raise ValueError(f"pool-domain tensor must have static shape {expected_shape}.")
+            raise ValueError(
+                f"pool-domain tensor must have static shape {expected_shape}."
+            )
         stride = (expected_shape[1], 1) if expected_stride is None else expected_stride
-        if cutlass.const_expr(tensor.stride[0] != stride[0] or tensor.stride[1] != stride[1]):
+        if cutlass.const_expr(
+            tensor.stride[0] != stride[0] or tensor.stride[1] != stride[1]
+        ):
             raise ValueError("pool-domain tensor has an unexpected stride.")
 
     def _build_megamoe_device_workspace(self) -> DeviceWorkspace:
@@ -626,7 +735,12 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # Reserve a slot for the scheduler's atomic work-id counter (persistent-grid
         # dynamic work distribution in atomic_counter mode).
         dw.register(
-            self.sched_work_id_region, cutlass.Int32, (4,), buffer_space="local", byte_alignment=16, reset="tail_reset"
+            self.sched_work_id_region,
+            cutlass.Int32,
+            (4,),
+            buffer_space="local",
+            byte_alignment=16,
+            reset="tail_reset",
         )
         # Local mirror of the shared token_src_metadata (Int64 per pool slot), filled
         # host-side after the launch so the recompute/col-output validation can read it.
@@ -665,7 +779,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     @property
     def _shared_metadata_offset(self) -> int:
         """Byte offset of the token_comm shared token_src_metadata (for the host mirror copy)."""
-        return self._mega_device_workspace.offset(self.token_comm._router.token_src_metadata_region)
+        return self._mega_device_workspace.offset(
+            self.token_comm._router.token_src_metadata_region
+        )
 
     @property
     def _local_region_by_name(self) -> dict:
@@ -678,7 +794,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             "l1_token_buffer": self.token_comm.fc1_activation_region,
             "token_src_metadata": self.token_src_metadata_local_region,
         }
-        return {name: SimpleNamespace(nbytes=dw.nbytes(region)) for name, region in name_to_region.items()}
+        return {
+            name: SimpleNamespace(nbytes=dw.nbytes(region))
+            for name, region in name_to_region.items()
+        }
 
     def get_workspace_sizes(self) -> Tuple[int, int]:
         """Return required (local, shared/symmetric) workspace bytes."""
@@ -707,21 +826,33 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.token_comm.wait_for_sizes_ready(self._mega_device_workspace)
 
     @cute.jit
-    def token_comm_hook_fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
+    def token_comm_hook_fc1_tma_b_predispatch_spin(
+        self, token_comm_args, work_tile_info
+    ):
         """No-op: FC1 input readiness is enforced by the scheduler extension's fc1_ready spin."""
         pass
 
     @cute.jit
-    def token_comm_hook_dispatch_warp_body(self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx):
+    def token_comm_hook_dispatch_warp_body(
+        self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx
+    ):
         """Transfer warps (8-11): pull grad_out from peers into the local FC1 pool."""
         self.token_comm.token_in(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
-        if cutlass.const_expr(self.token_comm.token_back_enabled and not self.token_back_standalone):
-            self.token_comm.token_back(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
+        if cutlass.const_expr(
+            self.token_comm.token_back_enabled and not self.token_back_standalone
+        ):
+            self.token_comm.token_back(
+                self.tc_smem_ws, token_comm_storage.buffer.data_ptr()
+            )
 
     @cute.jit
-    def token_comm_hook_token_back_warp_body(self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx):
+    def token_comm_hook_token_back_warp_body(
+        self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx
+    ):
         """Standalone token-back warps (12-15): push grad_x back to source ranks."""
-        self.token_comm.token_back(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
+        self.token_comm.token_back(
+            self.tc_smem_ws, token_comm_storage.buffer.data_ptr()
+        )
 
     @cute.jit
     def token_comm_hook_kernel_tail(self, token_comm_args, *, warp_idx, lane_idx, tidx):
@@ -729,7 +860,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         if cutlass.const_expr(self.enable_grad_y2_col_quant):
             self._snapshot_grad_y2_expert_sizes(tidx)
         cute.arch.sync_threads()
-        if (warp_idx >= self.dispatch_warp_id[0]) & (warp_idx <= self.dispatch_warp_id[-1]):
+        if (warp_idx >= self.dispatch_warp_id[0]) & (
+            warp_idx <= self.dispatch_warp_id[-1]
+        ):
             self.token_comm.reset_tail()
         self.token_comm.remove_device_members()
 
@@ -834,7 +967,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         activation_sf_pool = cute.make_tensor(
             _sf_pool_atom.iterator,
             cute.make_layout(
-                (self.token_comm.worst_case_sf_token_count, self.hidden // self.sf_vec_size),
+                (
+                    self.token_comm.worst_case_sf_token_count,
+                    self.hidden // self.sf_vec_size,
+                ),
                 stride=(self.token_comm.activation_sf_hidden_padded, 1),
             ),
         )
@@ -842,7 +978,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         fc1_output_sf = dw.tensor(self.fc1_output_sf_region)
         fc1_done_counter = dw.tensor(self.fc1_done_counter_region)
         load_balance_counter = (
-            dw.tensor(self.load_balance_counter_region) if self.token_back_schedule_mode == "atomic_counter" else None
+            dw.tensor(self.load_balance_counter_region)
+            if self.token_back_schedule_mode == "atomic_counter"
+            else None
         )
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(dw)
 
@@ -853,7 +991,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 output_activation.iterator,
                 cute.make_layout(
                     (output_activation.shape[0], 1, output_activation.shape[1]),
-                    stride=(output_activation.stride[0], output_activation.stride[0], output_activation.stride[1]),
+                    stride=(
+                        output_activation.stride[0],
+                        output_activation.stride[0],
+                        output_activation.stride[1],
+                    ),
                 ),
             )
             pre_reduced_sf = None
@@ -871,7 +1013,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             fc2_output = cute.make_tensor(
                 pre_reduced.iterator,
                 cute.make_layout(
-                    (pre_reduced.shape[0] * pre_reduced.shape[1], _combine_hidden), stride=(_combine_hidden, 1)
+                    (pre_reduced.shape[0] * pre_reduced.shape[1], _combine_hidden),
+                    stride=(_combine_hidden, 1),
                 ),
             )
 
@@ -921,7 +1064,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
         # Post-kernel top-k reduction: dequant + K-sum into the final output.
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
-            self._topk_reduce(pre_reduced, pre_reduced_sf, output_activation, None, stream)
+            self._topk_reduce(
+                pre_reduced, pre_reduced_sf, output_activation, None, stream
+            )
 
         # Export the routed dfc2 input in token-axis MXFP8 form. The source
         # grad_out pool and its row-wise SF remain resident after reset_tail.
@@ -930,21 +1075,37 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             data_offset = dw.offset(self.token_comm.fc1_activation_region)
             sf_offset = dw.offset(self.token_comm.fc1_activation_sf_region)
             sizes_offset = dw.offset(self.grad_y2_sizes_region)
-            sf_pool_bytes = self.token_comm.worst_case_sf_token_count * (self.hidden // self.sf_vec_size)
+            sf_pool_bytes = self.token_comm.worst_case_sf_token_count * (
+                self.hidden // self.sf_vec_size
+            )
             src_data = cute.make_tensor(
                 cute.make_ptr(
-                    self.ab_dtype, lw.toint() + Int64(data_offset), AddressSpace.gmem, assumed_align=128
+                    self.ab_dtype,
+                    lw.toint() + Int64(data_offset),
+                    AddressSpace.gmem,
+                    assumed_align=128,
                 ),
                 cute.make_layout(
-                    (self.token_comm.worst_case_token_count, self.hidden), stride=(self.hidden, 1)
+                    (self.token_comm.worst_case_token_count, self.hidden),
+                    stride=(self.hidden, 1),
                 ),
             )
             src_sf_u8 = cute.make_tensor(
-                cute.make_ptr(cutlass.Uint8, lw.toint() + Int64(sf_offset), AddressSpace.gmem, assumed_align=16),
+                cute.make_ptr(
+                    cutlass.Uint8,
+                    lw.toint() + Int64(sf_offset),
+                    AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 cute.make_layout((sf_pool_bytes,)),
             )
             expert_sizes = cute.make_tensor(
-                cute.make_ptr(cutlass.Int32, lw.toint() + Int64(sizes_offset), AddressSpace.gmem, assumed_align=16),
+                cute.make_ptr(
+                    cutlass.Int32,
+                    lw.toint() + Int64(sizes_offset),
+                    AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 cute.make_layout((self.num_experts_per_rank,)),
             )
             self.grad_y2_col_quant(

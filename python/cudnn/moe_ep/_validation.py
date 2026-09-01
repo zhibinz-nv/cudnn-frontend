@@ -225,7 +225,7 @@ def validate_training_weights(
     config: ForwardConfig,
     weights: MoeEpTrainingWeights,
 ) -> torch.device:
-    """Validate fixed MXFP8 weight bindings used by training resources."""
+    """Validate fixed MXFP8 weight bindings used by a training plan."""
 
     if not isinstance(weights, MoeEpTrainingWeights):
         raise TypeError("weights must be a MoeEpTrainingWeights, " f"got {type(weights).__name__}")
@@ -270,7 +270,7 @@ def validate_training_weights(
     for name, tensor, shape in expected:
         _validate_tensor_representation(name, tensor, shape)
         if not isinstance(tensor, BlockScaledTensor):
-            raise TypeError(f"{name} must be an MXFP8 BlockScaledTensor for " "fixed training resources")
+            raise TypeError(f"{name} must be an MXFP8 BlockScaledTensor for " "slotless training")
         if tensor.format is not MoeFormat.MXFP8:
             raise NotImplementedError(f"{name} must use format='mxfp8', got {tensor.format.value!r}")
         if not tensor.data.is_contiguous() or not tensor.scale.is_contiguous():

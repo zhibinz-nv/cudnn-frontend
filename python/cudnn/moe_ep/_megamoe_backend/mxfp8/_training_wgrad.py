@@ -6,15 +6,10 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
-
 import torch
 
-from ..._types import MoeEpTrainingWgradOperands
+from ..._types import MoeEpTrainingContext, MoeEpTrainingWgradOperands
 from ._launch import _to_cute
-
-if TYPE_CHECKING:
-    from ._training_resources import Mxfp8TrainingSlotViews
 
 
 class Mxfp8TrainingWgradExporter:
@@ -110,63 +105,63 @@ class Mxfp8TrainingWgradExporter:
 
     def export(
         self,
-        slot: "Mxfp8TrainingSlotViews",
+        context: MoeEpTrainingContext,
     ) -> MoeEpTrainingWgradOperands:
-        """Write and return the fixed-capacity grouped-WGrad operands."""
+        """Write final operands into one borrowed TE context."""
 
-        if slot.col_quant_data is None or slot.col_quant_sf is None:
-            raise RuntimeError("training WGrad export requires forward col-quant")
-        pool_rows = slot.fc1_recompute.shape[0]
-        if slot.col_quant_data.shape[0] != pool_rows:
+        forward = context.forward
+        wgrad = context.wgrad
+        pool_rows = wgrad.fc1_recompute.shape[0]
+        if forward.fc1_a.shape[1] != pool_rows:
             raise RuntimeError("forward/backward WGrad pool capacities differ")
 
         self._copy_gate_up_data(
-            slot.wgrad_fc1_b,
-            slot.fc1_col_output,
+            wgrad.fc1_b,
+            wgrad.fc1_col_output,
             self.intermediate,
         )
-        slot.wgrad_fc2_a.copy_(slot.fc1_recompute.transpose(0, 1))
+        wgrad.fc2_a.copy_(wgrad.fc1_recompute.transpose(0, 1))
         self._expand_scales(
-            slot.col_quant_sf,
-            slot.valid_route_counts,
-            slot.expert_offsets,
-            slot.wgrad_fc1_sfa,
+            forward.fc1_a_scale_compact,
+            wgrad.valid_route_counts,
+            wgrad.expert_offsets,
+            wgrad.fc1_sfa,
             non_k_size=self.hidden,
         )
         self._expand_scales(
-            slot.fc1_col_output_sf,
-            slot.valid_route_counts,
-            slot.expert_offsets,
-            slot.wgrad_fc1_sfb,
+            wgrad.fc1_col_output_sf,
+            wgrad.valid_route_counts,
+            wgrad.expert_offsets,
+            wgrad.fc1_sfb,
             non_k_size=2 * self.intermediate,
             deinterleave_gate_up=self.intermediate,
         )
         self._expand_scales(
-            slot.fc1_recompute_sf,
-            slot.valid_route_counts,
-            slot.expert_offsets,
-            slot.wgrad_fc2_sfa,
+            wgrad.fc1_recompute_sf,
+            wgrad.valid_route_counts,
+            wgrad.expert_offsets,
+            wgrad.fc2_sfa,
             non_k_size=self.intermediate,
         )
         self._expand_scales(
-            slot.grad_y2_sf,
-            slot.valid_route_counts,
-            slot.expert_offsets,
-            slot.wgrad_fc2_sfb,
+            wgrad.fc2_b_scale_compact,
+            wgrad.valid_route_counts,
+            wgrad.expert_offsets,
+            wgrad.fc2_sfb,
             non_k_size=self.hidden,
         )
 
         return MoeEpTrainingWgradOperands(
-            fc1_a=slot.col_quant_data.transpose(0, 1),
-            fc1_sfa=slot.wgrad_fc1_sfa,
-            fc1_b=slot.wgrad_fc1_b,
-            fc1_sfb=slot.wgrad_fc1_sfb,
-            fc2_a=slot.wgrad_fc2_a,
-            fc2_sfa=slot.wgrad_fc2_sfa,
-            fc2_b=slot.grad_y2,
-            fc2_sfb=slot.wgrad_fc2_sfb,
-            expert_offsets=slot.expert_offsets,
-            valid_route_counts=slot.valid_route_counts,
+            fc1_a=forward.fc1_a,
+            fc1_sfa=wgrad.fc1_sfa,
+            fc1_b=wgrad.fc1_b,
+            fc1_sfb=wgrad.fc1_sfb,
+            fc2_a=wgrad.fc2_a,
+            fc2_sfa=wgrad.fc2_sfa,
+            fc2_b=wgrad.fc2_b,
+            fc2_sfb=wgrad.fc2_sfb,
+            expert_offsets=wgrad.expert_offsets,
+            valid_route_counts=wgrad.valid_route_counts,
         )
 
 

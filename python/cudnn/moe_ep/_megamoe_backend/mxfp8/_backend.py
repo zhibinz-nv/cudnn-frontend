@@ -44,7 +44,7 @@ class Mxfp8Backend:
         self._completion_recorded = False
         self._device_work_may_be_pending = False
         self._ep_launch_ready = config.ep_size == 1
-        self._training_resource_owner = None
+        self._training_plan_owner = None
         self._lock = threading.RLock()
 
     @property
@@ -180,20 +180,19 @@ class Mxfp8Backend:
                 self._warmed_up = True
                 return output
 
-    def prepare_training_resources(
+    def prepare_training(
         self,
         weights: MoeEpTrainingWeights,
         *,
-        slot_count: int,
         lane_count: int,
     ):
-        """Allocate the fixed slot/lane roots used by the training graph path."""
+        """Prepare kernels, weights, and FE-owned per-lane scratch."""
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("MoeEp MXFP8 backend is closed")
-            if self._training_resource_owner is not None:
-                raise RuntimeError("MoeEp training resources already exist")
+            if self._training_plan_owner is not None:
+                raise RuntimeError("MoeEp training plan already exists")
             training_config = replace(
                 self.config,
                 generate_c=True,
@@ -224,15 +223,14 @@ class Mxfp8Backend:
                 graph_kernel_config,
                 self.device,
             )
-            from ._training_resources import Mxfp8TrainingResourceOwner
+            from ._training_resources import Mxfp8TrainingPlanOwner
 
-            owner = Mxfp8TrainingResourceOwner(
+            owner = Mxfp8TrainingPlanOwner(
                 training_config,
                 self.device,
                 forward,
                 backward,
                 weights,
-                slot_count=slot_count,
                 lane_count=lane_count,
             )
             try:
@@ -240,7 +238,7 @@ class Mxfp8Backend:
             except Exception:
                 owner.close()
                 raise
-            self._training_resource_owner = owner
+            self._training_plan_owner = owner
             return owner
 
     def close(self) -> None:
@@ -250,12 +248,12 @@ class Mxfp8Backend:
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("MoeEp MXFP8 backend cannot be closed during " "CUDA graph capture")
-                if self._plan is not None or self._training_resource_owner is not None:
+                if self._plan is not None or self._training_plan_owner is not None:
                     torch.cuda.synchronize(self.device)
                 self._adapter.close()
-                if self._training_resource_owner is not None:
-                    self._training_resource_owner.close()
-                    self._training_resource_owner = None
+                if self._training_plan_owner is not None:
+                    self._training_plan_owner.close()
+                    self._training_plan_owner = None
                 if self._plan is not None:
                     self._plan.close()
                     self._plan = None
