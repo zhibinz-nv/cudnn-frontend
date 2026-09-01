@@ -85,8 +85,8 @@ output = op(
 For inference CUDA Graph capture, call `op.warmup(...)` with the exact
 bindings before capture. `MoeEp` supports `close()` and context-manager use.
 
-Fixed-resource training uses the same operator and binds graph-stable weights,
-slots, and execution lanes:
+Slotless training uses the same operator with graph-stable weights,
+caller-owned contexts/outputs, and FE-owned execution lanes:
 
 ```python
 from cudnn import MoeEpTrainingWeights
@@ -97,21 +97,32 @@ weights = MoeEpTrainingWeights(
     backward_w2_transpose=backward_w2t_mxfp8,
     backward_w1_transpose=backward_w1t_mxfp8,
 )
-resources = op.prepare_training_resources(weights, slot_count=2, lane_count=1)
-slot, lane = resources.slots[0], resources.lanes[0]
-
-resources.refresh_weights()
-output = resources.forward(slot, lane, activation, topk_idx, topk_weights)
-grad_activation, dprob, wgrad_operands = resources.backward(
-    slot, lane, grad_output
+plan = op.prepare_training(weights, lane_count=1)
+context = te_context_cache.acquire(
+    plan.buffer_specs, token_count=activation.shape[0]
 )
-overflow = resources.finalize_overflow((slot,), lane)
+lane = plan.lanes[0]
+
+plan.refresh_weights()
+output = plan.forward(
+    context, lane, activation, topk_idx, topk_weights, out=output_buffer
+)
+grad_activation, dprob, wgrad_operands = plan.backward(
+    context,
+    lane,
+    grad_output,
+    grad_activation_out=grad_activation_buffer,
+    dprob_out=dprob_buffer,
+)
+overflow = plan.finalize_overflow(
+    (context,), lane, out=overflow_buffer
+)
 ```
 
 The WGrad result is a fixed-capacity grouped-GEMM operand bundle, not dense
 optimizer-ready weight gradients. See the detailed
 [MoE + Expert Parallel API](../fe-oss-apis/moe_ep.md) reference for
-installation, all constructor arguments, tensor formats, training resource
+installation, all constructor arguments, tensor formats, training context
 lifecycle, tuning, overflow handling, and CUDA Graph requirements. MoeEP is
 distinct from the cuDNN graph [MoE Grouped Matmul](MoeGroupedMatmul.md)
 operation.
@@ -131,7 +142,7 @@ operation.
 - `num_experts` divisible by the expert-parallel group size.
 - An explicit positive `max_tokens_per_rank`.
 
-The fixed-resource CUDA Graph path has hardware acceptance through EP32 when
+The slotless CUDA Graph path has hardware acceptance through EP32 when
 all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability
 layer does not impose an EP-size ceiling; cross-MNNVL execution is not part of
 the validated support surface.
@@ -147,7 +158,7 @@ The current executable output format is BF16. The expert-combine path accepts
 BF16 or MXFP8. NVFP4 types are represented by the public API but native NVFP4
 operands, combine, and output are not executable by this backend.
 
-Fixed-resource training narrows dynamic activation and gradient inputs to
+Slotless training narrows dynamic activation and gradient inputs to
 contiguous BF16 or FP32 tensors. Training weights are contiguous MXFP8
 block-scaled tensors.
 
@@ -174,7 +185,7 @@ Inference uses:
 All inference tensors must reside on one device, and the local token count must
 satisfy `T <= max_tokens_per_rank`.
 
-Fixed-resource training uses a narrower graph-stable contract:
+Slotless training uses a narrower graph-stable contract:
 
 - `activation` and `grad_output`: contiguous `(T, H)`, BF16 or FP32;
 - `topk_idx`: contiguous `(T, K)`, Int32;
@@ -184,7 +195,7 @@ Fixed-resource training uses a narrower graph-stable contract:
 - transposed backward weights: contiguous MXFP8 block-scaled tensors with
   shapes `(E_local, H, I)` and `(E_local, 2I, H)`;
 - forward output: `(T, H)`, BF16;
-- `grad_activation`: fixed-slot `(T, H)`, FP32;
+- `grad_activation`: caller-provided `(T, H)`, FP32;
 - `dprob`: source-order `(T, K)`, FP32;
 - `wgrad_operands`: a fixed-capacity `MoeEpTrainingWgradOperands` bundle.
 
@@ -198,7 +209,7 @@ EP2+ execution requires:
 - an initialized NCCL process group;
 - `nvshmem4py` and usable NVSHMEM libraries;
 - direct peer access among every pair of participating ranks; and
-- consistent rank ordering, resource sizes, tuning, slot selection, and lane
+- consistent rank ordering, plan/context schemas, tuning, context selection, and lane
   ordering across the group.
 
 `max_recv_size_per_rank` bounds receive capacity. When omitted, it defaults to
@@ -208,5 +219,5 @@ the worst-case route count:
 ep_size * max_tokens_per_rank * top_k
 ```
 
-Resources cannot grow during CUDA Graph replay. Capacity or storage changes
-require resource preparation and graph capture again.
+Plans and contexts cannot grow during CUDA Graph replay. Capacity or storage
+changes require plan preparation, new contexts, and graph capture again.

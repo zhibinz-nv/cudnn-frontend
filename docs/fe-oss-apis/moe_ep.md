@@ -23,7 +23,8 @@ usable NVSHMEM peer topology.
 ## Public API and constructor
 
 The public surface exports `MoeEp`, `MoeEpTrainingWeights`,
-`MoeEpTrainingResources`, `MoeEpTrainingSlot`, `MoeEpExecutionLane`,
+`MoeEpTrainingPlan`, `MoeEpTrainingContext`, its forward/WGrad buffer bundles,
+`MoeEpTrainingBufferSpecs`, `MoeEpExecutionLane`,
 `MoeEpTrainingWgradOperands`, `BlockScaledTensor`, `MoeFormat`, and
 `MoeEpTuningConfig`.
 
@@ -43,8 +44,8 @@ The `MoeEp` constructor accepts:
 | `combine_format` | `"bf16"` or `"mxfp8"` |
 | `apply_topk_in_fc1` | Must be `True` |
 | `gate_up_clamp` | Optional finite clamp magnitude |
-| `token_padding_size` | Positive; training fixed resources use 128 internally |
-| `sf_padding_size` | Positive multiple of 128; training fixed resources use 128 internally |
+| `token_padding_size` | Positive; slotless training uses 128 internally |
+| `sf_padding_size` | Positive multiple of 128; slotless training uses 128 internally |
 | `tuning` | Optional `MoeEpTuningConfig`; must match on every EP rank |
 
 When `max_recv_size_per_rank` is omitted, the backend allocates for the
@@ -58,12 +59,15 @@ An explicit value is capped at that same worst-case count.
 
 ## Breaking training API migration
 
-This release removes the legacy dynamic compact training API:
+This release removes both the legacy dynamic compact API and the unpublished
+FE-owned fixed-slot API:
 
 - `MoeEp.backward(...)`
 - constructor arguments `generate_c` and `backward_wgrad_mode`
 - forward returns containing compact `fc1_c` and `route_metadata`
 - `MoeEpWgradForwardStash` and `MoeEpWgradOperands`
+- `MoeEp.prepare_training_resources`
+- `MoeEpTrainingResources`, `MoeEpTrainingSlot`, and `slot_count`
 
 Old:
 
@@ -79,19 +83,27 @@ dx, dprob = op.backward(
 New:
 
 ```python
-resources = op.prepare_training_resources(
-    training_weights,
-    slot_count=2,
-    lane_count=1,
+plan = op.prepare_training(training_weights, lane_count=1)
+specs = plan.buffer_specs
+context = te_context_cache.acquire(
+    specs, token_count=activation.shape[0]
 )
-slot = resources.slots[0]
-lane = resources.lanes[0]
-resources.refresh_weights()
-output = resources.forward(
-    slot, lane, activation, topk_idx, topk_weights
+lane = plan.lanes[0]
+plan.refresh_weights()
+output = plan.forward(
+    context, lane, activation, topk_idx, topk_weights, out=output_buffer
 )
-dx, dprob, operands = resources.backward(slot, lane, grad_output)
-overflow = resources.finalize_overflow((slot,), lane)
+dx, dprob, operands = plan.backward(
+    context,
+    lane,
+    grad_output,
+    grad_activation_out=grad_activation_buffer,
+    dprob_out=dprob_buffer,
+)
+overflow = plan.finalize_overflow(
+    (context,), lane, out=overflow_buffer
+)
+# te_context_cache.release(context) only after delayed WGrad completes.
 ```
 
 `dprob` now follows the MXFP8-staged kernel numerical contract and relaxed
@@ -169,9 +181,9 @@ replace their storage.
 bound to one CUDA device. Do not close an operator while a stream is capturing
 or while graph work using its resources remains outstanding.
 
-## Fixed-resource training
+## Slotless training
 
-Training uses `prepare_training_resources`:
+Training uses `prepare_training` and caller-owned context buffers:
 
 ```python
 from cudnn import MoeEpTrainingWeights
@@ -183,61 +195,92 @@ weights = MoeEpTrainingWeights(
     backward_w1_transpose=backward_w1t_mxfp8,
 )
 
-resources = op.prepare_training_resources(
-    weights,
-    slot_count=2,
-    lane_count=1,
+plan = op.prepare_training(weights, lane_count=1)
+specs = op.training_buffer_specs()  # Same object as plan.buffer_specs.
+context0 = te_context_cache.acquire(
+    specs, token_count=activation0.shape[0]
 )
-
-slot0, slot1 = resources.slots
-lane0 = resources.lanes[0]
+lane0 = plan.lanes[0]
 
 # Required after each in-place source-weight update and before the first
 # forward/backward that consumes that version.
-resources.refresh_weights()
+plan.refresh_weights()
 
-y0 = resources.forward(
-    slot0,
+y0 = plan.forward(
+    context0,
     lane0,
     activation0,
     topk_idx0,
     topk_weights0,
+    out=output0,
 )
-dx0, dprob0, operands0 = resources.backward(slot0, lane0, grad_output0)
-overflow = resources.finalize_overflow((slot0,), lane0)
+dx0, dprob0, operands0 = plan.backward(
+    context0,
+    lane0,
+    grad_output0,
+    grad_activation_out=grad_activation0,
+    dprob_out=dprob0_buffer,
+)
+overflow = plan.finalize_overflow(
+    (context0,), lane0, out=overflow0
+)
 ```
 
-`prepare_training_resources` is collective across `ep_group` and must execute
+`te_context_cache` above represents the Transformer Engine grouped-MLP cache,
+not an allocator supplied by cuDNN Frontend. It allocates each named tensor
+from the public shape, stride, dtype, device, and alignment in
+`MoeEpTrainingBufferSpecs`. The `outputs` specs similarly describe the
+full-capacity `forward`, `grad_activation`, `dprob`, and scalar `overflow`
+destinations. Each spec has a constrained `MoeEpBufferLifetime`: in eager
+execution, retire storage only after the named semantic phase and its queued
+stream work complete. A true `capture_pinned` field overrides that retirement
+boundary for capture: the address must remain valid until every graph
+executable that captured it is destroyed.
+
+`MoeEpTrainingContext.token_count` records the exact runtime token extent, not
+buffer capacity. Forward and backward reject any extent that differs from this
+value, so a cache may reuse the same storage for another extent only by issuing
+a new lightweight context wrapper with the new `token_count`.
+
+`prepare_training` is collective across `ep_group` and must execute
 outside CUDA Graph capture. All ranks must use matching static configuration,
-slot/lane counts, and tuning. The training backend internally enables FC1
+lane counts, context schemas, and tuning. The training backend internally enables FC1
 preactivation generation and fixed-capacity WGrad operands, and fixes token and
 scale-factor padding to 128.
 
 `forward`, `backward`, and `finalize_overflow` enqueue the same device
 operations in ordinary execution and in a caller-owned CUDA Graph. The caller
-owns capture, replay, stream/event dependencies, slot reuse, and resource
-lifetime.
+owns capture, replay, stream/event dependencies, context reuse, outputs, and
+the lifetime of every context and output buffer.
 
-A `MoeEp` instance can own only one training-resource set. Closing that set is
+A `MoeEp` instance can own only one training plan. Closing that plan is
 terminal for the operator: replacing source-weight storage requires a new
-operator, new resources, and new graph captures.
+operator, new plan, and new graph captures.
 
-### Slots and lanes
+### Contexts and lanes
 
-A persistent slot owns state that survives from matching forward to backward:
+A `MoeEpTrainingContext` is a TE-owned cache entry. Its forward bundle stores
+state that survives into normal backward:
 
 - routing indices and weights
 - pool-native FC1 preactivation
-- expert counts and padded offsets
-- kernel dprob
-- backward auxiliaries and outputs
-- fixed-capacity WGrad operands
-- per-slot overflow flags
+- FC1 WGrad A-side activation and compact scale source
+- forward/backward overflow flags
+
+Its WGrad bundle stores expert counts/offsets, backward auxiliaries, and the
+final FC1/FC2 operand buffers. The current implementation retains
+`dfc2_recompute` in the normal-backward kernel; normal backward writes FC2
+operands into the TE context, which may then outlive it for delayed WGrad.
+FE borrows these tensors only for the duration of each method call and never
+allocates, caches, clears, or frees them.
 
 An execution lane owns mutable router, protocol, and kernel scratch. Multiple
 active streams require distinct lanes. Distributed MegaMoE communication
 kernels must be ordered identically on every rank with captured CUDA events;
 the kernels cannot be launched in unordered concurrent lanes.
+Peer-visible combine and dprob landing zones remain inside the opaque
+symmetric lane slab and are copied to the caller's ordinary output tensors
+before `forward` or `backward` returns.
 
 All peer-visible regions are constructed in deterministic order. Their sizes
 are validated and normalized across ranks before symmetric allocation so every
@@ -265,7 +308,7 @@ The inference `topk_weights` contract is:
 - shape `(T, K)`
 - floating point
 
-Fixed-resource training uses a narrower, graph-stable staging ABI:
+Slotless training uses a narrower, graph-stable staging ABI:
 
 - contiguous BF16 or FP32 `activation` and `grad_output`, each shaped `(T, H)`;
 - contiguous Int32 `topk_idx` shaped `(T, K)`;
@@ -284,7 +327,7 @@ they are not revalidated by host code after graph capture.
 
 Each data and scale tensor must be contiguous, reside on one device, and use
 logical block axis 1. Plain FP16 operands are accepted by inference staging,
-but fixed-resource training accepts only BF16 or FP32 `activation` and
+but slotless training accepts only BF16 or FP32 `activation` and
 `grad_output`.
 
 Replacing weight storage requires preparing resources and capturing again.
@@ -294,24 +337,24 @@ Callers must establish stream/event ordering for in-place weight updates.
 
 `MoeEpTrainingWeights` uses a public contiguous MXFP8 layout, while the Rubin
 kernels consume fixed-address K-major, gate/up-interleaved, and blocked-scale
-layouts. `resources.refresh_weights()` enqueues the required device-only copies
+layouts. `plan.refresh_weights()` enqueues the required device-only copies
 and layout transforms into the internal kernel bindings.
 
 The caller must obey all of the following:
 
 - update both the data and scale tensors in place; their storage addresses,
   shape, stride, dtype, device, and capacity must remain unchanged;
-- call `resources.refresh_weights()` after every source-weight update and
+- call `plan.refresh_weights()` after every source-weight update and
   before any forward or backward that consumes the new version;
 - establish stream ordering from the weight update to the refresh and from the
   refresh to the first consumer, using the same stream or CUDA events;
 - do not refresh between a matching forward and backward; both operations must
   observe the same four-tensor weight version;
 - do not overlap a refresh with any forward/backward that reads the shared
-  internal weight bindings, including operations using another slot or lane;
+  internal weight bindings, including operations using another context or lane;
 - replace any source storage only by closing the existing operator, creating a
-  new `MoeEp` instance and resources, and recapturing every graph that
-  references them. Closed resources cannot be reopened or replaced on the same
+  new `MoeEp` instance and plan, and recapturing every graph that
+  references them. Closed plans cannot be reopened or replaced on the same
   operator.
 
 For CUDA Graph execution, capture the refresh at the appropriate update
@@ -321,10 +364,20 @@ boundary:
 with torch.cuda.graph(graph, stream=stream):
     # An optimizer or external producer must complete its in-place updates
     # before this node.
-    resources.refresh_weights()
-    y = resources.forward(slot, lane, x, topk_idx, topk_weights)
-    dx, dprob, operands = resources.backward(slot, lane, grad_output)
-    overflow = resources.finalize_overflow((slot,), lane)
+    plan.refresh_weights()
+    y = plan.forward(
+        context, lane, x, topk_idx, topk_weights, out=output_buffer
+    )
+    dx, dprob, operands = plan.backward(
+        context,
+        lane,
+        grad_output,
+        grad_activation_out=grad_activation_buffer,
+        dprob_out=dprob_buffer,
+    )
+    overflow = plan.finalize_overflow(
+        (context,), lane, out=overflow_buffer
+    )
 ```
 
 Replay then executes the captured device refresh; Python is not called during
@@ -334,9 +387,9 @@ recapture.
 
 ## Backward outputs
 
-Fixed-resource backward returns:
+Slotless backward returns live views of caller-provided outputs:
 
-- `grad_activation`: fixed-slot `(T, H)` FP32 view
+- `grad_activation`: `(T, H)` FP32 view
 - `dprob`: source-order `(T, K)` kernel dprob
 - `MoeEpTrainingWgradOperands`
 
@@ -349,7 +402,8 @@ atomic accumulation order. Bitwise determinism is not guaranteed.
 - FC2 operands: `fc2_a`, `fc2_sfa`, `fc2_b`, `fc2_sfb`
 - `expert_offsets` and `valid_route_counts`
 
-These tensors have fixed addresses and fixed capacity. Device
+These tensors are non-owning views into the caller's context and have fixed
+capacity. Device
 `expert_offsets`/`valid_route_counts` describe the live expert segments and
 padding rows are zero. This release guarantees the producer ABI only; a
 specific grouped-WGrad consumer is future integration work. The result is not
@@ -372,13 +426,14 @@ Every rank in an EP group must use the same tuning configuration.
 
 ## Capacity and overflow
 
-`max_recv_size_per_rank` defines bounded receive capacity. Resources cannot
-grow during capture. A capacity change requires preparation and recapture.
+`max_recv_size_per_rank` defines bounded receive capacity. Plans and contexts
+cannot grow during capture. A capacity change requires preparation, new
+contexts, and recapture.
 
 Inference checks its per-call overflow result after the fused launch. The
-fixed-resource training transport deterministically truncates overflow so all
+slotless training transport deterministically truncates overflow so all
 ranks complete the communication protocol. `finalize_overflow` combines the
-forward and backward flags for all selected slots and performs one captured
+forward and backward flags for all selected contexts and performs one captured
 scalar MAX all-reduce for EP2+.
 
 With `drop_on_overflow=True`, `finalize_overflow` returns a one-element Int32
@@ -398,17 +453,19 @@ For inference:
 3. each rank captures its forward graph;
 4. graph execs are replayed in the same cross-rank order.
 
-For fixed-resource training:
+For slotless training:
 
-1. all ranks collectively call `prepare_training_resources`;
-2. all ranks perform an ordinary
+1. all ranks collectively call `prepare_training`;
+2. the caller allocates one context and output set per active eager
+   microbatch or captured graph call-site from `buffer_specs`;
+3. all ranks perform an ordinary
    `refresh_weights -> forward -> backward -> finalize_overflow` warmup so
    every staging, MegaMoE, and WGrad-export kernel is compiled;
-3. each rank captures its outer graph;
-4. ranks align after capture;
-5. graph execs are submitted in lockstep without host synchronization inside
+4. each rank captures its outer graph;
+5. ranks align after capture;
+6. graph execs are submitted in lockstep without host synchronization inside
    a replay burst;
-6. all stream work completes before resources are closed.
+7. all stream work completes before plans or contexts are released.
 
 For EP2+:
 
@@ -417,9 +474,10 @@ Independent lane storage does not permit unordered collective-kernel overlap.
 Use distinct lanes for simultaneously active streams and captured CUDA events
 to impose the same cross-stream order on every rank.
 
-Each graph binds fixed tensor shapes, addresses, slots, lanes, and token
-extent. Dynamic routing values may change in place; dynamic shapes may not.
-Different token extents may share prepared resources, but each extent must be
+Each graph binds fixed tensor shapes, context/output addresses, lanes, and
+token extent. A context is pinned to that capture site until the graph is
+destroyed. Dynamic routing values may change in place; dynamic shapes may not.
+Different token extents may share a prepared plan, but each extent must be
 warmed and captured as its own graph specialization.
 
 ## NVSHMEM topology
@@ -443,13 +501,13 @@ The following configurations are exercised by the current test and probe
 suite. This list describes validation coverage and does not broaden the
 topology contract beyond one direct-P2P MNNVL domain:
 
-- EP1 inference, fixed-resource training, overflow, and CUDA Graph replay
+- EP1 inference, slotless training, overflow, and CUDA Graph replay
 - single-node EP2/EP3/EP4 inference
 - single-node EP2/EP4 training
 - noncontiguous EP2 inference and training subgroups
 - multi-node forward acceptance for EP4/EP6/EP12/EP16
 - multi-node backward acceptance for EP8/EP16/EP32
-- fixed-resource CUDA Graph launchers for EP8/EP16/EP32
+- slotless CUDA Graph launchers for EP8/EP16/EP32
 
 ## Validation
 
@@ -479,7 +537,7 @@ the standard `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `RANK`, and `WORLD_SIZE`
 environment. The multi-node fixture initializes NCCL and defaults
 `NVIDIA_IMEX_CHANNELS=0`.
 
-Run distributed fixed-resource probes from an existing Slurm allocation:
+Run distributed slotless probes from an existing Slurm allocation:
 
 ```bash
 NVSHMEM_REMOTE_TRANSPORT=none \
