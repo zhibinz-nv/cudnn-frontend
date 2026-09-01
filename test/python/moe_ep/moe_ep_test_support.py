@@ -23,6 +23,8 @@ from moe_ep.moe_ep_reference import (
 
 __all__ = [
     "_allocate_dense_grouped_wgrad_outputs",
+    "_allocate_training_binding",
+    "_allocate_training_context",
     "_assert_backward_matches",
     "_assert_fixed_training_drop_overflow_result",
     "_assert_fixed_training_matches_reference",
@@ -57,10 +59,11 @@ __all__ = [
     "_training_source_pointers",
     "_training_weight_source_pointers",
     "_training_weight_source_values",
-    "_TrainingResourceContractOwner",
+    "_TrainingPlanContractOwner",
+    "_TrainingContextCache",
     "_training_abi_prepared",
     "_training_config",
-    "_training_contract_resources",
+    "_training_contract_plan",
     "_training_inputs",
     "_training_prepared_pair",
     "_training_staging_tensors",
@@ -404,6 +407,104 @@ def _training_weights(args=None):
     )
 
 
+def _allocate_training_tensor(spec):
+    """Allocate one exactly-strided, explicitly aligned test-side buffer."""
+
+    storage_elements = 0
+    if all(int(extent) > 0 for extent in spec.shape):
+        storage_elements = (
+            sum(
+                (int(extent) - 1) * int(stride)
+                for extent, stride in zip(spec.shape, spec.stride)
+            )
+            + 1
+        )
+    nbytes = storage_elements * spec.dtype.itemsize
+    raw = torch.empty(
+        nbytes + spec.alignment,
+        dtype=torch.uint8,
+        device=spec.device,
+    )
+    byte_offset = (-raw.data_ptr()) % spec.alignment
+    storage = raw.narrow(0, byte_offset, nbytes)
+    typed = storage.view(spec.dtype)
+    return torch.as_strided(typed, spec.shape, spec.stride)
+
+
+def _allocate_training_context(specs, *, token_count=None):
+    """Reference TE-cache allocation from the public context specs."""
+
+    from cudnn.moe_ep import (
+        MoeEpForwardContextBuffers,
+        MoeEpTrainingContext,
+        MoeEpWgradGradientBuffers,
+    )
+
+    forward = {
+        name: _allocate_training_tensor(spec)
+        for name, spec in specs.forward_context.items()
+    }
+    wgrad = {
+        name: _allocate_training_tensor(spec)
+        for name, spec in specs.wgrad_gradients.items()
+    }
+    if token_count is None:
+        token_count = specs.outputs["forward"].shape[0]
+    return MoeEpTrainingContext(
+        token_count=token_count,
+        forward=MoeEpForwardContextBuffers(**forward),
+        wgrad=MoeEpWgradGradientBuffers(**wgrad),
+    )
+
+
+def _allocate_training_binding(specs, *, token_count=None):
+    """Allocate one context plus ordinary caller-owned output buffers."""
+
+    outputs = {
+        name: _allocate_training_tensor(spec) for name, spec in specs.outputs.items()
+    }
+    return SimpleNamespace(
+        context=_allocate_training_context(specs, token_count=token_count),
+        y=outputs["forward"],
+        dx=outputs["grad_activation"],
+        dprob=outputs["dprob"],
+        overflow=outputs["overflow"],
+    )
+
+
+class _TrainingContextCache:
+    """Minimal TE-side reference cache used by slotless lifecycle tests."""
+
+    def __init__(self, specs):
+        self.specs = specs
+        self._free = []
+        self._leased = set()
+
+    def acquire(self, *, token_count=None):
+        if token_count is None:
+            token_count = self.specs.outputs["forward"].shape[0]
+        context = (
+            self._free.pop()
+            if self._free
+            else _allocate_training_context(self.specs, token_count=token_count)
+        )
+        if context.token_count != token_count:
+            context = replace(context, token_count=token_count)
+        self._leased.add(id(context))
+        return context
+
+    def release(self, context):
+        if id(context) not in self._leased:
+            raise ValueError("context is not leased by this cache")
+        self._leased.remove(id(context))
+        self._free.append(context)
+
+    def clear(self):
+        if self._leased:
+            raise RuntimeError("cannot clear cache with live contexts")
+        self._free.clear()
+
+
 def _training_empty_block_scaled_like(tensor, *, axis: int, format: str):
     import cudnn
 
@@ -451,7 +552,7 @@ def _training_weight_defect(weights, field: str, defect: str):
         error_type = TypeError
         message = (
             f"weights.{field} must be an MXFP8 BlockScaledTensor for "
-            "fixed training resources"
+            "slotless training"
         )
     elif defect == "logical_shape":
         wrong_shape = (expected_shape[0] - 1, *expected_shape[1:])
@@ -504,10 +605,12 @@ def _training_weight_defect(weights, field: str, defect: str):
     return replace(weights, **{field: invalid}), error_type, message
 
 
-class _TrainingResourceContractOwner:
-    def __init__(self, *, slot_count: int = 2, lane_count: int = 1) -> None:
-        self.slot_count = slot_count
+class _TrainingPlanContractOwner:
+    def __init__(self, *, lane_count: int = 1) -> None:
+        from cudnn.moe_ep import MoeEpTrainingBufferSpecs
+
         self.lane_count = lane_count
+        self.buffer_specs = MoeEpTrainingBufferSpecs({}, {}, {})
         self.close_calls = 0
         self.refresh_calls = 0
         self.views_calls = 0
@@ -524,43 +627,36 @@ class _TrainingResourceContractOwner:
         del token_count
         raise AssertionError("invalid finalization must fail before workspace access")
 
-    def finalize_overflow(self, slots, *, lane):
-        from cudnn.moe_ep._megamoe_backend.mxfp8._training_resources import (
-            Mxfp8TrainingResourceOwner,
-        )
-
-        return Mxfp8TrainingResourceOwner.finalize_overflow(
-            self,
-            slots,
-            lane=lane,
-        )
+    def finalize_overflow(self, contexts, *, lane, out):
+        if not contexts:
+            raise ValueError("finalize_overflow requires at least one context")
+        if len({id(context) for context in contexts}) != len(contexts):
+            raise ValueError("finalize_overflow contexts must be unique")
+        if lane < 0 or lane >= self.lane_count:
+            raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
+        out.zero_()
+        return out
 
     def close(self) -> None:
         self.close_calls += 1
 
 
-def _training_contract_resources(
+def _training_contract_plan(
     *,
     owner=None,
-    slot_count: int = 2,
     lane_count: int = 1,
 ):
-    from cudnn.moe_ep import MoeEpTrainingResources
+    from cudnn.moe_ep import MoeEpTrainingPlan
 
     if owner is None:
-        owner = _TrainingResourceContractOwner(
-            slot_count=slot_count,
-            lane_count=lane_count,
-        )
-    resources = MoeEpTrainingResources(
+        owner = _TrainingPlanContractOwner(lane_count=lane_count)
+    plan = MoeEpTrainingPlan(
         owner=owner,
-        operator_token=object(),
         weights=SimpleNamespace(mock_training_weights=True),
-        slot_count=slot_count,
         lane_count=lane_count,
         device=torch.device("cpu"),
     )
-    return resources, owner
+    return plan, owner
 
 
 def _training_staging_tensors(*, capacity: int | None = None):
@@ -972,7 +1068,7 @@ def _run_grouped_wgrad_kernel(
 
     if prefix not in ("fc1", "fc2"):
         raise ValueError(f"prefix must be 'fc1' or 'fc2', got {prefix!r}")
-    # Graph callers provide one persistent output per training slot. This is
+    # Graph callers provide one persistent output per captured context. This is
     # currently also the isolation key for a temporary production-WGrad
     # workaround: an EP2 graph with two same-signature calls produced correct
     # operands but corrupted the second WGrad when both calls shared the
@@ -1148,7 +1244,7 @@ def _fixed_training_reference(
         generate_c=True,
         backward_wgrad_mode="operands",
         # The standalone operand oracle's legacy ABI uses 256-row
-        # segments. Production fixed resources use 128-row segments;
+        # segments. Production slotless training uses 128-row segments;
         # their represented dense gradients are compared below.
         token_padding_size=256,
     )
@@ -1301,15 +1397,30 @@ def _run_fixed_training_batch(resources, lane, cases):
 
     resources.refresh_weights()
     outputs = [
-        resources.forward(slot, lane, args[0], args[3], args[4])
-        for slot, args, _ in cases
+        resources.forward(
+            binding.context,
+            lane,
+            args[0],
+            args[3],
+            args[4],
+            out=binding.y,
+        )
+        for binding, args, _ in cases
     ]
     backwards = [
-        resources.backward(slot, lane, grad_output) for slot, _, grad_output in cases
+        resources.backward(
+            binding.context,
+            lane,
+            grad_output,
+            grad_activation_out=binding.dx,
+            dprob_out=binding.dprob,
+        )
+        for binding, _, grad_output in cases
     ]
     overflow = resources.finalize_overflow(
-        tuple(slot for slot, _, _ in cases),
+        tuple(binding.context for binding, _, _ in cases),
         lane,
+        out=cases[0][0].overflow,
     )
     return tuple(
         SimpleNamespace(
@@ -1331,7 +1442,7 @@ def _capture_fixed_training_batch(
     *,
     grouped_wgrad_outputs=None,
 ):
-    """Capture the shared fixed-training sequence for one or more slots."""
+    """Capture the shared slotless sequence for one or more contexts."""
 
     if grouped_wgrad_outputs is not None and len(grouped_wgrad_outputs) != len(cases):
         raise ValueError("grouped_wgrad_outputs must match the captured case count")
@@ -1416,17 +1527,17 @@ def _training_public_pointers(actual) -> dict[str, int]:
     return pointers
 
 
-def _prefill_training_graph_sentinels(slot_views, actual) -> None:
+def _prefill_training_graph_sentinels(binding, actual) -> None:
     """Poison every history-sensitive full-capacity destination."""
 
-    slot_views.routing_topk_idx.fill_(0x1A2B3C)
-    slot_views.routing_topk_weights.fill_(31.25)
-    slot_views.forward_output.fill_(29.0)
-    slot_views.backward_output.fill_(-27.0)
-    slot_views.grad_activation.fill_(23.0)
-    slot_views.dprob.fill_(-19.0)
-    slot_views.expert_offsets.fill_(-17)
-    slot_views.valid_route_counts.fill_(-13)
+    context = binding.context
+    context.forward.routing_topk_idx.fill_(0x1A2B3C)
+    context.forward.routing_topk_weights.fill_(31.25)
+    binding.y.fill_(29.0)
+    binding.dx.fill_(23.0)
+    binding.dprob.fill_(-19.0)
+    context.wgrad.expert_offsets.fill_(-17)
+    context.wgrad.valid_route_counts.fill_(-13)
     for name in _TRAINING_WGRAD_DATA_FIELDS:
         getattr(actual.wgrads, name).fill_(1.0)
     for name in _TRAINING_WGRAD_SF_FIELDS:
@@ -1434,19 +1545,19 @@ def _prefill_training_graph_sentinels(slot_views, actual) -> None:
 
 
 def _assert_training_graph_tails_are_reset(
-    slot_views,
+    binding,
     actual,
     *,
     token_count: int,
     capacity: int,
 ) -> None:
+    context = binding.context
     if token_count < capacity:
-        assert slot_views.routing_topk_idx[token_count:].eq(-1).all()
-        assert slot_views.routing_topk_weights[token_count:].eq(0).all()
-        assert slot_views.forward_output[token_count:].eq(0).all()
-        assert slot_views.backward_output[token_count:].eq(0).all()
-        assert slot_views.grad_activation[token_count:].eq(0).all()
-        assert slot_views.dprob[token_count:].eq(0).all()
+        assert context.forward.routing_topk_idx[token_count:].eq(-1).all()
+        assert context.forward.routing_topk_weights[token_count:].eq(0).all()
+        assert binding.y[token_count:].eq(0).all()
+        assert binding.dx[token_count:].eq(0).all()
+        assert binding.dprob[token_count:].eq(0).all()
 
     counts = actual.wgrads.valid_route_counts.detach().cpu().tolist()
     expected_offsets = []

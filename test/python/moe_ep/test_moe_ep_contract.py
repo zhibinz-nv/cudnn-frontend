@@ -24,8 +24,8 @@ import torch.distributed as dist
 from cudnn.moe_ep import (
     MoeEp,
     MoeEpExecutionLane,
-    MoeEpTrainingResources,
-    MoeEpTrainingSlot,
+    MoeEpTrainingBufferSpecs,
+    MoeEpTrainingPlan,
     MoeEpTrainingWgradOperands,
 )
 from cudnn.moe_ep._megamoe_backend._workspace import (
@@ -36,10 +36,11 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import (
     canonical_json_sha256,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_resources import (
-    Mxfp8TrainingResourceOwner,
+    Mxfp8TrainingPlanOwner,
     _build_training_abi_facts,
     _harmonize_symmetric_regions,
     _verify_training_abi_across_ranks,
+    build_training_buffer_specs,
     build_training_workspace_requirements,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_stage import (
@@ -50,10 +51,12 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._training_weights import (
 )
 from cudnn.moe_ep._validation import validate_training_weights
 from moe_ep.moe_ep_test_support import (
+    _TrainingContextCache,
+    _allocate_training_context,
     _forward_config,
     _training_abi_prepared,
     _training_config,
-    _training_contract_resources,
+    _training_contract_plan,
     _training_inputs,
     _training_prepared_pair,
     _training_staging_tensors,
@@ -100,7 +103,6 @@ def _install_contract_backend(
     monkeypatch,
     *,
     weights=None,
-    slot_count=1,
     lane_count=1,
 ):
     import cudnn.moe_ep._backend as backend_seam
@@ -114,13 +116,10 @@ def _install_contract_backend(
 
     def create_backend(config, device):
         del config, device
-        owner = _ContractOwner(
-            slot_count=slot_count,
-            lane_count=lane_count,
-        )
+        owner = _ContractOwner(lane_count=lane_count)
         backend = SimpleNamespace(
             owner=owner,
-            prepare_training_resources=Mock(return_value=owner),
+            prepare_training=Mock(return_value=owner),
             close=Mock(),
         )
         state.backends.append(backend)
@@ -133,9 +132,9 @@ def _install_contract_backend(
 
 
 class _ContractOwner:
-    def __init__(self, *, slot_count: int = 2, lane_count: int = 1) -> None:
-        self.slot_count = slot_count
+    def __init__(self, *, lane_count: int = 1) -> None:
         self.lane_count = lane_count
+        self.buffer_specs = MoeEpTrainingBufferSpecs({}, {}, {})
         self.close_calls = 0
         self.refresh_calls = 0
         self.views_calls = 0
@@ -152,12 +151,15 @@ class _ContractOwner:
         del token_count
         raise AssertionError("invalid finalization must fail before workspace access")
 
-    def finalize_overflow(self, slots, *, lane):
-        return Mxfp8TrainingResourceOwner.finalize_overflow(
-            self,
-            slots,
-            lane=lane,
-        )
+    def finalize_overflow(self, contexts, *, lane, out):
+        if not contexts:
+            raise ValueError("finalize_overflow requires at least one context")
+        if len({id(context) for context in contexts}) != len(contexts):
+            raise ValueError("finalize_overflow contexts must be unique")
+        if lane < 0 or lane >= self.lane_count:
+            raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
+        out.zero_()
+        return out
 
     def close(self) -> None:
         self.close_calls += 1
@@ -418,44 +420,40 @@ def test_training_stager_validation(scenario):
         ),
     ],
 )
-def test_training_resource_lifecycle(monkeypatch, scenario):
+def test_training_plan_lifecycle(monkeypatch, scenario):
     if scenario == "prepare-and-close":
         weights = _training_weights()
-        _, state = _install_contract_backend(
-            monkeypatch,
-            weights=weights,
-            slot_count=2,
-        )
+        _, state = _install_contract_backend(monkeypatch, weights=weights)
         operator = _operator()
-        resources = operator.prepare_training_resources(
+        plan = operator.prepare_training(
             weights,
-            slot_count=2,
             lane_count=1,
         )
-        assert isinstance(resources, MoeEpTrainingResources)
-        assert all(isinstance(slot, MoeEpTrainingSlot) for slot in resources.slots)
-        assert isinstance(resources.lanes[0], MoeEpExecutionLane)
-        resources.refresh_weights()
+        assert isinstance(plan, MoeEpTrainingPlan)
+        assert not hasattr(plan, "slots")
+        assert isinstance(plan.lanes[0], MoeEpExecutionLane)
+        assert operator.training_buffer_specs() is plan.buffer_specs
+        plan.refresh_weights()
         owner = state.backends[0].owner
         assert owner.refresh_calls == 1
         operator.close()
-        assert resources.closed
+        assert plan.closed
         assert owner.close_calls == 1
         return
 
     if scenario == "duplicate-close-reopen":
         weights, state = _install_contract_backend(monkeypatch)
         old_operator = _operator()
-        old_resources = old_operator.prepare_training_resources(weights)
+        old_plan = old_operator.prepare_training(weights)
         with pytest.raises(RuntimeError, match="already exist"):
-            old_operator.prepare_training_resources(weights)
-        old_resources.close()
+            old_operator.prepare_training(weights)
+        old_plan.close()
         with pytest.raises(RuntimeError, match="create a new MoeEp instance"):
-            old_operator.prepare_training_resources(weights)
+            old_operator.prepare_training(weights)
         old_operator.close()
         with _operator() as new_operator:
-            new_resources = new_operator.prepare_training_resources(weights)
-            assert not new_resources.closed
+            new_plan = new_operator.prepare_training(weights)
+            assert not new_plan.closed
         assert len(state.backends) == 2
         assert state.validate.call_count == 2
         return
@@ -468,7 +466,7 @@ def test_training_resource_lifecycle(monkeypatch, scenario):
             "is_current_stream_capturing",
             lambda: True,
         )
-        owner = object.__new__(Mxfp8TrainingResourceOwner)
+        owner = object.__new__(Mxfp8TrainingPlanOwner)
         owner._lock = threading.RLock()
         owner._closed = False
         owner._runtime = None
@@ -488,14 +486,10 @@ def test_training_resource_lifecycle(monkeypatch, scenario):
             backend.close()
         return
 
-    resources, owner = _training_contract_resources(
-        owner=_ContractOwner(slot_count=2, lane_count=1)
-    )
-    foreign, _ = _training_contract_resources(
-        owner=_ContractOwner(slot_count=2, lane_count=1)
-    )
-    slot = resources.slots[0]
-    lane = resources.lanes[0]
+    plan, owner = _training_contract_plan(owner=_ContractOwner(lane_count=1))
+    foreign, _ = _training_contract_plan(owner=_ContractOwner(lane_count=1))
+    context = object()
+    lane = plan.lanes[0]
     activation = torch.empty((0, 128), dtype=torch.bfloat16)
     routing = (
         torch.empty((0, 2), dtype=torch.int32),
@@ -503,52 +497,67 @@ def test_training_resource_lifecycle(monkeypatch, scenario):
     )
     binding_checks = (
         (
-            "training slot does not belong",
-            resources.forward,
-            (foreign.slots[0], lane, activation, *routing),
+            "execution lane does not belong",
+            lambda: plan.forward(
+                context,
+                foreign.lanes[0],
+                activation,
+                *routing,
+                out=activation,
+            ),
         ),
         (
             "execution lane does not belong",
-            resources.forward,
-            (slot, foreign.lanes[0], activation, *routing),
-        ),
-        (
-            "training slot does not belong",
-            resources.backward,
-            (MoeEpTrainingSlot(99, slot._resource_token), lane, activation.float()),
-        ),
-        (
-            "execution lane does not belong",
-            resources.backward,
-            (slot, MoeEpExecutionLane(99, lane._resource_token), activation.float()),
+            lambda: plan.backward(
+                context,
+                MoeEpExecutionLane(99, lane._plan_token),
+                activation.float(),
+                grad_activation_out=activation.float(),
+                dprob_out=torch.empty((0, 2)),
+            ),
         ),
     )
-    for message, call, args in binding_checks:
+    for message, call in binding_checks:
         with pytest.raises(ValueError, match=message):
-            call(*args)
+            call()
 
     finalization_checks = (
-        ("at least one slot", (), lane),
-        ("slots must be unique", (slot, slot), lane),
-        ("overflow slot does not belong", (foreign.slots[0],), lane),
-        ("overflow execution lane does not belong", (slot,), foreign.lanes[0]),
+        ("at least one context", (), lane),
+        ("contexts must be unique", (context, context), lane),
+        (
+            "overflow execution lane does not belong",
+            (context,),
+            foreign.lanes[0],
+        ),
     )
-    for message, slots, selected_lane in finalization_checks:
+    for message, contexts, selected_lane in finalization_checks:
         with pytest.raises(ValueError, match=message):
-            resources.finalize_overflow(slots, selected_lane)
+            plan.finalize_overflow(
+                contexts,
+                selected_lane,
+                out=torch.empty(1, dtype=torch.int32),
+            )
 
-    resources.close()
-    resources.close()
-    assert resources.closed
+    plan.close()
+    plan.close()
+    assert plan.closed
     assert owner.close_calls == 1
     closed_calls = (
-        resources.refresh_weights,
-        lambda: resources.forward(slot, lane, activation, *routing),
-        lambda: resources.backward(slot, lane, activation.float()),
-        lambda: resources.finalize_overflow((slot,), lane),
+        plan.refresh_weights,
+        lambda: plan.forward(context, lane, activation, *routing, out=activation),
+        lambda: plan.backward(
+            context,
+            lane,
+            activation.float(),
+            grad_activation_out=activation.float(),
+            dprob_out=torch.empty((0, 2)),
+        ),
+        lambda: plan.finalize_overflow(
+            (context,), lane, out=torch.empty(1, dtype=torch.int32)
+        ),
     )
     for call in closed_calls:
-        with pytest.raises(RuntimeError, match="resources are closed"):
+        with pytest.raises(RuntimeError, match="plan is closed"):
             call()
     assert owner.refresh_calls == 0
     assert owner.views_calls == 0
@@ -563,6 +572,21 @@ def test_public_training_surface_and_overflow_requirements(monkeypatch):
     ]
     expected += ["expert_offsets", "valid_route_counts"]
     assert [field.name for field in fields(MoeEpTrainingWgradOperands)] == expected
+    assert not hasattr(cudnn, "MoeEpTrainingSlot")
+    assert not hasattr(cudnn, "MoeEpTrainingResources")
+    assert not hasattr(MoeEp, "prepare_training_resources")
+    assert hasattr(MoeEp, "prepare_training")
+    assert hasattr(MoeEp, "training_buffer_specs")
+    for name in (
+        "MoeEpBufferLifetime",
+        "MoeEpForwardContextBuffers",
+        "MoeEpTrainingBufferSpec",
+        "MoeEpTrainingBufferSpecs",
+        "MoeEpTrainingContext",
+        "MoeEpTrainingPlan",
+        "MoeEpWgradGradientBuffers",
+    ):
+        assert getattr(cudnn, name) is getattr(cudnn.moe_ep, name)
     assert not hasattr(cudnn, "MoeEpWgradForwardStash")
     assert not hasattr(cudnn, "MoeEpWgradOperands")
 
@@ -585,6 +609,46 @@ def test_public_training_surface_and_overflow_requirements(monkeypatch):
                 ep_group=object(),
             )
         )
+
+
+@pytest.mark.L0
+def test_reference_te_context_cache_uses_public_specs():
+    config = _training_config()
+    forward, backward = _training_prepared_pair(config)
+    owner = Mxfp8TrainingPlanOwner(
+        config,
+        torch.device("cpu"),
+        forward,
+        backward,
+        _training_weights(),
+        lane_count=1,
+    )
+    plan = MoeEpTrainingPlan(
+        owner=owner,
+        weights=owner.weight_bindings.weights,
+        lane_count=1,
+        device=torch.device("cpu"),
+    )
+    specs = plan.buffer_specs
+    cache = _TrainingContextCache(specs)
+    context = cache.acquire()
+    assert context.forward.fc1_a.shape == specs.forward_context["fc1_a"].shape
+    assert context.forward.fc1_a.stride() == specs.forward_context["fc1_a"].stride
+    assert context.wgrad.fc2_b.stride() == specs.wgrad_gradients["fc2_b"].stride
+    with pytest.raises(RuntimeError, match="live contexts"):
+        cache.clear()
+    pointer = context.wgrad.fc2_a.data_ptr()
+    cache.release(context)
+    reused = cache.acquire()
+    assert reused is context
+    assert reused.wgrad.fc2_a.data_ptr() == pointer
+    cache.release(reused)
+    smaller = cache.acquire(token_count=3)
+    assert smaller.token_count == 3
+    assert smaller.wgrad.fc2_a.data_ptr() == pointer
+    cache.release(smaller)
+    cache.clear()
+    plan.close()
 
 
 @pytest.mark.L0
@@ -626,33 +690,77 @@ def test_training_weight_and_workspace_address_stability():
             self.closed = True
 
     runtime = Runtime()
-    owner = Mxfp8TrainingResourceOwner(
+    owner = Mxfp8TrainingPlanOwner(
         config,
         torch.device("cpu"),
         forward,
         backward,
         _training_weights(),
-        slot_count=2,
         lane_count=1,
         runtime_manager=SimpleNamespace(
             acquire=lambda actual_config, actual_device: runtime
         ),
     )
+    first_context = _allocate_training_context(owner.buffer_specs)
+    second_context = _allocate_training_context(owner.buffer_specs)
     try:
-        first = owner.views(slot=0, lane=0, token_count=4)
-        second = owner.views(slot=1, lane=0, token_count=4)
+        with pytest.raises(ValueError, match="token_count does not match"):
+            owner.views(context=first_context, lane=0, token_count=3)
+        oversized = replace(first_context, token_count=5)
+        with pytest.raises(ValueError, match="exceeds capacity"):
+            owner.views(context=oversized, lane=0, token_count=5)
+        malformed = replace(
+            first_context,
+            forward=replace(
+                first_context.forward,
+                routing_topk_idx=first_context.forward.routing_topk_idx[:-1],
+            ),
+        )
+        with pytest.raises(ValueError, match="routing_topk_idx shape"):
+            owner.views(context=malformed, lane=0, token_count=4)
+        first = owner.views(context=first_context, lane=0, token_count=4)
+        second = owner.views(context=second_context, lane=0, token_count=4)
         assert (
             first.forward.workspace.local["kernel_local_workspace"].data_ptr()
             == second.forward.workspace.local["kernel_local_workspace"].data_ptr()
         )
-        assert first.slot.fc1_preact.data_ptr() != second.slot.fc1_preact.data_ptr()
-        assert first.slot.dprob.data_ptr() != second.slot.dprob.data_ptr()
+        assert (
+            first.context.forward.fc1_preact.data_ptr()
+            != second.context.forward.fc1_preact.data_ptr()
+        )
+        assert (
+            first.context.wgrad.fc2_a.data_ptr()
+            != second.context.wgrad.fc2_a.data_ptr()
+        )
+        assert (
+            first.forward.workspace.local["col_quant_data"].data_ptr()
+            == first_context.forward.fc1_a.data_ptr()
+        )
+        assert (
+            first.forward.workspace.symmetric["topk_weights"].data_ptr()
+            == first_context.forward.routing_topk_weights.data_ptr()
+        )
+        assert (
+            first.backward.workspace.local["backward_fc1_preact"].data_ptr()
+            == first_context.forward.fc1_preact.data_ptr()
+        )
         assert (
             first.forward_expert_size_snapshot.data_ptr()
             == second.forward_expert_size_snapshot.data_ptr()
         )
+        overlapping_output = first_context.forward.fc1_preact.reshape(-1)[
+            : 4 * 128
+        ].view(4, 128)
+        with pytest.raises(ValueError, match="must not overlap"):
+            owner.validate_outputs(first_context, {"forward": overlapping_output})
+        with pytest.raises(ValueError, match="overflow shape"):
+            owner.validate_outputs(
+                first_context,
+                {"overflow": torch.empty(2, dtype=torch.int32)},
+            )
     finally:
         owner.close()
+    first_context.forward.fc1_preact.zero_()
     assert runtime.closed
 
 
@@ -681,17 +789,48 @@ def test_training_workspace_layout_and_abi_contracts(monkeypatch):
         config,
         forward,
         backward,
-        slot_count=2,
         lane_count=1,
+    )
+    specs = build_training_buffer_specs(
+        config,
+        forward,
+        backward,
+        torch.device("cpu"),
     )
     symmetric_names = tuple(region.name for region in requirements.symmetric_regions)
     local_names = tuple(region.name for region in requirements.local_regions)
     assert "lane.0.forward.symmetric.kernel_shared_workspace" in symmetric_names
     assert "lane.0.backward.symmetric.kernel_shared_workspace" in symmetric_names
-    assert "slot.0.backward.symmetric.backward_dprob" in symmetric_names
-    assert "slot.1.backward.symmetric.backward_dprob" in symmetric_names
-    assert "slot.0.persistent.local.fc1_preact" in local_names
-    assert "slot.1.persistent.local.fc1_preact" in local_names
+    assert "lane.0.backward.symmetric.backward_dprob" in symmetric_names
+    assert not any(
+        name.startswith("slot.") for name in (*symmetric_names, *local_names)
+    )
+    assert not any("backward_aux" in name for name in local_names)
+    assert specs.forward_context["fc1_preact"].shape == (512, 512)
+    assert specs.forward_context["fc1_a"].shape == (128, 512)
+    assert (
+        specs.forward_context["fc1_a"].lifetime
+        is cudnn.MoeEpBufferLifetime.DELAYED_WGRAD
+    )
+    assert (
+        specs.forward_context["fc1_preact"].lifetime
+        is cudnn.MoeEpBufferLifetime.NORMAL_BACKWARD
+    )
+    assert all(
+        spec.capture_pinned
+        for group in (
+            specs.forward_context,
+            specs.wgrad_gradients,
+            specs.outputs,
+        )
+        for spec in group.values()
+    )
+    assert (
+        specs.outputs["overflow"].lifetime
+        is cudnn.MoeEpBufferLifetime.STREAM_COMPLETION
+    )
+    assert specs.wgrad_gradients["fc2_a"].shape == (256, 512)
+    assert specs.wgrad_gradients["fc2_b"].stride == (1, 512)
 
     uneven = WorkspaceRequirements(
         max_tokens_per_rank=1,
@@ -730,7 +869,7 @@ def test_training_workspace_layout_and_abi_contracts(monkeypatch):
         _training_abi_prepared("backward"),
         _training_weights(),
         abi_requirements,
-        slot_count=2,
+        specs,
         lane_count=1,
         source_tree_digest="source",
     )
@@ -740,7 +879,7 @@ def test_training_workspace_layout_and_abi_contracts(monkeypatch):
         _training_abi_prepared("backward"),
         _training_weights(),
         abi_requirements,
-        slot_count=2,
+        specs,
         lane_count=2,
         source_tree_digest="source",
     )

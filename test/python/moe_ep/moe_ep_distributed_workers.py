@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from moe_ep.moe_ep_test_support import (
+    _allocate_training_binding,
     _assert_backward_matches,
     _assert_grouped_wgrads_match_reference,
     _assert_matches_reference,
@@ -140,12 +141,17 @@ def _distributed_subgroup_output_worker(
     )
     try:
         subgroup_memberships = ((0, 2), (1, 3))
-        subgroups = [dist.new_group(list(members), backend="nccl") for members in subgroup_memberships]
+        subgroups = [
+            dist.new_group(list(members), backend="nccl")
+            for members in subgroup_memberships
+        ]
         subgroup_index = global_rank % 2
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
+        actual_global_ranks = tuple(
+            dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
+        )
 
         _run_forward_output_case(
             device=device,
@@ -237,7 +243,7 @@ def _run_backward_reference_case(
     gate_up_clamp: float | None = None,
     expected_global_ranks: tuple[int, ...] | None = None,
 ) -> None:
-    """Run fixed-resource training after the independent distributed oracle."""
+    """Run slotless training after the independent distributed oracle."""
 
     from cudnn import MoeEp
 
@@ -278,27 +284,33 @@ def _run_backward_reference_case(
         gate_up_clamp=gate_up_clamp,
     )
     try:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             weights,
-            slot_count=1,
             lane_count=1,
         )
-        slot = resources.slots[0]
-        lane = resources.lanes[0]
-        resources.refresh_weights()
-        actual_y = resources.forward(
-            slot,
+        binding = _allocate_training_binding(plan.buffer_specs)
+        lane = plan.lanes[0]
+        plan.refresh_weights()
+        actual_y = plan.forward(
+            binding.context,
             lane,
             args[0],
             args[3],
             args[4],
+            out=binding.y,
         )
-        actual_dx, actual_dprob, actual_wgrads = resources.backward(
-            slot,
+        actual_dx, actual_dprob, actual_wgrads = plan.backward(
+            binding.context,
             lane,
             grad_output,
+            grad_activation_out=binding.dx,
+            dprob_out=binding.dprob,
         )
-        overflow = resources.finalize_overflow((slot,), lane)
+        overflow = plan.finalize_overflow(
+            (binding.context,),
+            lane,
+            out=binding.overflow,
+        )
         grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
         torch.cuda.synchronize(device)
 
@@ -371,7 +383,7 @@ def _distributed_subgroup_backward_reference_worker(
     global_world_size: int,
     init_file: str,
 ) -> None:
-    """Run fixed-resource backward in two non-contiguous EP2 groups."""
+    """Run slotless backward in two non-contiguous EP2 groups."""
 
     device = torch.device("cuda", global_rank)
     torch.cuda.set_device(device)
@@ -400,7 +412,9 @@ def _distributed_subgroup_backward_reference_worker(
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
+        actual_global_ranks = tuple(
+            dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
+        )
         assert ep_size == len(expected_global_ranks)
         assert ep_rank == expected_global_ranks.index(global_rank)
         assert actual_global_ranks == expected_global_ranks

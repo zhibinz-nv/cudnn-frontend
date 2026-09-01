@@ -261,7 +261,7 @@ def test_mxfp8_forward_multinode_matches_reference(
         ),
     ],
 )
-def test_fixed_training_resources_multinode_match_independent_reference(
+def test_slotless_training_multinode_match_independent_reference(
     torchrun_world,
     ep_size,
     required_world_size,
@@ -328,9 +328,8 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
     try:
         lane_count = rank_zero_lane_count if world.rank == 0 else other_lane_count
         try:
-            op.prepare_training_resources(
+            op.prepare_training(
                 weights,
-                slot_count=1,
                 lane_count=lane_count,
             )
         except Exception as error:

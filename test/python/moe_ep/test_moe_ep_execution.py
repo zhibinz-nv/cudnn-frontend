@@ -21,6 +21,7 @@ from moe_ep.moe_ep_reference import (
 )
 from moe_ep.moe_ep_test_support import (
     _allocate_dense_grouped_wgrad_outputs,
+    _allocate_training_binding,
     _assert_fixed_training_drop_overflow_result,
     _assert_fixed_training_matches_reference,
     _assert_grouped_wgrads_match_reference,
@@ -279,15 +280,15 @@ def test_training_scenarios_match_independent_reference(
         combine_format=combine_format,
         gate_up_clamp=gate_up_clamp,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(args),
-            slot_count=1,
             lane_count=1,
         )
+        binding = _allocate_training_binding(plan.buffer_specs)
         actual = _run_fixed_training_batch(
-            resources,
-            resources.lanes[0],
-            ((resources.slots[0], args, grad_output),),
+            plan,
+            plan.lanes[0],
+            ((binding, args, grad_output),),
         )[0]
         torch.cuda.synchronize(device)
         assert actual.overflow.eq(0).all()
@@ -344,15 +345,15 @@ def test_grouped_wgrad_kernel_matches_independent_reference():
         max_recv_size_per_rank=args[0].shape[0] * args[3].shape[1],
         drop_on_overflow=True,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(args),
-            slot_count=1,
             lane_count=1,
         )
+        binding = _allocate_training_binding(plan.buffer_specs)
         actual = _run_fixed_training_batch(
-            resources,
-            resources.lanes[0],
-            ((resources.slots[0], args, grad_output),),
+            plan,
+            plan.lanes[0],
+            ((binding, args, grad_output),),
         )[0]
         grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual.wgrads)
         torch.cuda.synchronize(device)
@@ -439,20 +440,22 @@ def test_grouped_wgrad_accumulates_two_microbatches():
         max_recv_size_per_rank=args0[0].shape[0] * args0[3].shape[1],
         drop_on_overflow=True,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(args0),
-            slot_count=2,
             lane_count=1,
         )
+        bindings = tuple(
+            _allocate_training_binding(plan.buffer_specs) for _ in range(2)
+        )
         batch = tuple(
-            (slot, args, grad_output)
-            for slot, args, grad_output in zip(
-                resources.slots,
+            (binding, args, grad_output)
+            for binding, args, grad_output in zip(
+                bindings,
                 (args0, args1),
                 grad_outputs,
             )
         )
-        actuals = _run_fixed_training_batch(resources, resources.lanes[0], batch)
+        actuals = _run_fixed_training_batch(plan, plan.lanes[0], batch)
         accumulated = _allocate_dense_grouped_wgrad_outputs(
             actuals[0].wgrads,
             fill_value=0,
@@ -598,15 +601,15 @@ def test_training_cuda_graph_replay(case):
         combine_format=case.combine_format,
         token_padding_size=128,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(inputs[0][0]),
-            slot_count=len(inputs),
             lane_count=1,
         )
-        lane = resources.lanes[0]
+        lane = plan.lanes[0]
+        bindings = tuple(_allocate_training_binding(plan.buffer_specs) for _ in inputs)
         batch = tuple(
-            (slot, args, grad_output)
-            for slot, (args, grad_output) in zip(resources.slots, inputs)
+            (binding, args, grad_output)
+            for binding, (args, grad_output) in zip(bindings, inputs)
         )
 
         def assert_batch(actuals):
@@ -624,13 +627,13 @@ def test_training_cuda_graph_replay(case):
                     args[3],
                 )
 
-        eager_actuals = _run_fixed_training_batch(resources, lane, batch)
+        eager_actuals = _run_fixed_training_batch(plan, lane, batch)
         torch.cuda.synchronize(device)
         assert_batch(eager_actuals)
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         captured = _capture_fixed_training_batch(
-            resources,
+            plan,
             lane,
             batch,
             stream,
@@ -681,13 +684,17 @@ def test_two_shape_cuda_graph_specialization_addresses_and_refresh():
         max_recv_size_per_rank=1,
         drop_on_overflow=True,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             weights,
-            slot_count=1,
             lane_count=1,
         )
-        slot = resources.slots[0]
-        lane = resources.lanes[0]
+        lane = plan.lanes[0]
+        large_binding = _allocate_training_binding(
+            plan.buffer_specs, token_count=max_tokens
+        )
+        small_binding = _allocate_training_binding(
+            plan.buffer_specs, token_count=small_tokens
+        )
 
         def case_args(case):
             return (
@@ -706,11 +713,11 @@ def test_two_shape_cuda_graph_specialization_addresses_and_refresh():
                 gate_up_clamp=None,
             )
 
-        def warmup(case):
+        def warmup(case, binding):
             actual = _run_fixed_training_batch(
-                resources,
+                plan,
                 lane,
-                ((slot, case_args(case), case.grad_output),),
+                ((binding, case_args(case), case.grad_output),),
             )[0]
             torch.cuda.synchronize(device)
             assert actual.overflow.eq(0).all()
@@ -720,36 +727,32 @@ def test_two_shape_cuda_graph_specialization_addresses_and_refresh():
                 case.topk_idx,
             )
 
-        warmup(large)
-        warmup(small)
+        warmup(large, large_binding)
+        warmup(small, small_binding)
         capture_stream = torch.cuda.Stream(device=device)
         capture_stream.wait_stream(torch.cuda.current_stream(device))
 
-        def capture(case):
+        def capture(case, binding):
             captured = _capture_fixed_training_batch(
-                resources,
+                plan,
                 lane,
-                ((slot, case_args(case), case.grad_output),),
+                ((binding, case_args(case), case.grad_output),),
                 capture_stream,
             )
             return SimpleNamespace(
                 case=case,
+                binding=binding,
                 graph=captured.graph,
                 actual=captured.actuals[0],
                 public_pointers=captured.public_pointers[0],
                 source_pointers=_training_source_pointers(case),
             )
 
-        large_graph = capture(large)
-        small_graph = capture(small)
-        slot_views = resources._owner.views(
-            slot=slot.index,
-            lane=lane.index,
-            token_count=max_tokens,
-        ).slot
+        large_graph = capture(large, large_binding)
+        small_graph = capture(small, small_binding)
 
         def replay_and_check(captured):
-            _prefill_training_graph_sentinels(slot_views, captured.actual)
+            _prefill_training_graph_sentinels(captured.binding, captured.actual)
             captured.graph.replay()
             torch.cuda.synchronize(device)
             assert captured.actual.overflow.eq(0).all()
@@ -769,7 +772,7 @@ def test_two_shape_cuda_graph_specialization_addresses_and_refresh():
                 captured.case.topk_idx,
             )
             _assert_training_graph_tails_are_reset(
-                slot_views,
+                captured.binding,
                 captured.actual,
                 token_count=int(captured.case.activation.shape[0]),
                 capacity=max_tokens,
@@ -860,15 +863,15 @@ def test_overflow_boundary_and_cuda_graph_transitions():
         drop_on_overflow=True,
         token_padding_size=128,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(args),
-            slot_count=1,
             lane_count=1,
         )
+        binding = _allocate_training_binding(plan.buffer_specs)
         actual = _run_fixed_training_batch(
-            resources,
-            resources.lanes[0],
-            ((resources.slots[0], args, grad_output),),
+            plan,
+            plan.lanes[0],
+            ((binding, args, grad_output),),
         )[0]
         torch.cuda.synchronize(device)
         assert_result(actual, 0)
@@ -890,15 +893,14 @@ def test_overflow_boundary_and_cuda_graph_transitions():
         drop_on_overflow=True,
         token_padding_size=128,
     ) as op:
-        resources = op.prepare_training_resources(
+        plan = op.prepare_training(
             _fixed_training_weights(args),
-            slot_count=1,
             lane_count=1,
         )
-        slot = resources.slots[0]
-        lane = resources.lanes[0]
-        batch = ((slot, args, grad_output),)
-        warmup = _run_fixed_training_batch(resources, lane, batch)[0]
+        binding = _allocate_training_binding(plan.buffer_specs)
+        lane = plan.lanes[0]
+        batch = ((binding, args, grad_output),)
+        warmup = _run_fixed_training_batch(plan, lane, batch)[0]
         grouped_outputs = _allocate_dense_grouped_wgrad_outputs(warmup.wgrads)
         _dense_wgrads_from_grouped_kernel(
             warmup.wgrads,
@@ -909,7 +911,7 @@ def test_overflow_boundary_and_cuda_graph_transitions():
         capture_stream = torch.cuda.Stream(device=device)
         capture_stream.wait_stream(torch.cuda.current_stream(device))
         captured = _capture_fixed_training_batch(
-            resources,
+            plan,
             lane,
             batch,
             capture_stream,
