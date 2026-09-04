@@ -284,7 +284,7 @@ class MoeEpBackwardWeightStaging:
 
 @dataclass(frozen=True)
 class MoeEpTrainingForwardOutputs:
-    """Caller-owned forward destinations."""
+    """Forward destinations, including the lane's symmetric output buffer."""
 
     fc1_preact: torch.Tensor
     output: torch.Tensor | None = None
@@ -296,7 +296,7 @@ class MoeEpTrainingForwardOutputs:
 
 @dataclass(frozen=True)
 class MoeEpTrainingBackwardOutputs:
-    """Caller-owned backward and final grouped-WGrad destinations."""
+    """Backward destinations, including the lane's symmetric input gradient."""
 
     grad_activation: torch.Tensor | None = None
     dprob: torch.Tensor | None = None

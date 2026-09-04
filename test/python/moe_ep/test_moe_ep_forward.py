@@ -102,26 +102,52 @@ def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
     )
 
     assert PackageMoeEpTuningConfig is MoeEpTuningConfig
-    tuning = MoeEpTuningConfig(
+    forward_tuning = MoeEpTuningConfig(
         token_back_mode="standalone_warps",
         epi_flag_batch=(4, 2),
         token_in_flag_batch=4,
         group_hint=768,
     )
-    with MoeEp(**_forward_config(), tuning=tuning) as op:
-        assert op.tuning is tuning
-        kernel_config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
+    backward_tuning = MoeEpTuningConfig(
+        token_back_mode="epi_warps",
+        epi_flag_batch=(2, 2),
+        token_in_flag_batch=8,
+        group_hint=512,
+    )
+    with MoeEp(
+        **_forward_config(),
+        forward_tuning=forward_tuning,
+        backward_tuning=backward_tuning,
+    ) as op:
+        assert op.tuning is forward_tuning
+        assert op.forward_tuning is forward_tuning
+        assert op.backward_tuning is backward_tuning
+        forward_kernel_config = Mxfp8KernelConfig.from_operator_config(
+            op._forward_config,
+            tuning=op.forward_tuning,
+        )
+        backward_kernel_config = Mxfp8KernelConfig.from_operator_config(
+            op._forward_config,
+            tuning=op.backward_tuning,
+        )
 
-    assert kernel_config.tuning_signature(123) == (
+    assert forward_kernel_config.tuning_signature(123) == (
         "standalone_warps",
         (4, 2),
         4,
         768,
         False,
     )
+    assert backward_kernel_config.tuning_signature(123) == (
+        "epi_warps",
+        (2, 2),
+        8,
+        512,
+        False,
+    )
 
     with MoeEp(**_forward_config()) as default_op:
-        default_config = Mxfp8KernelConfig.from_forward_config(
+        default_config = Mxfp8KernelConfig.from_operator_config(
             default_op._forward_config
         )
     key_args = (
@@ -130,7 +156,12 @@ def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
         123,
         (),
     )
-    assert kernel_config.compile_key(*key_args) != default_config.compile_key(*key_args)
+    assert forward_kernel_config.compile_key(
+        *key_args
+    ) != default_config.compile_key(*key_args)
+    assert backward_kernel_config.compile_key(
+        *key_args
+    ) != forward_kernel_config.compile_key(*key_args)
 
 
 @pytest.mark.L0
@@ -142,7 +173,7 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
 
     with MoeEp(**_forward_config()) as op:
         default_forward = op._forward_config
-        default_config = Mxfp8KernelConfig.from_forward_config(default_forward)
+        default_config = Mxfp8KernelConfig.from_operator_config(default_forward)
         enabled_config = replace(
             default_config,
             enable_col_quant=True,
@@ -179,7 +210,7 @@ def test_bounded_receive_capacity_propagates_to_kernel_config():
         max_recv_size_per_rank=7,
         drop_on_overflow=False,
     ) as op:
-        config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
+        config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
 
     assert config.max_recv_size_per_rank == 7
     assert config.drop_on_overflow is False
@@ -205,7 +236,7 @@ def test_combine_format_maps_to_contract_wire(public_format, wire_format):
     )
 
     with MoeEp(**_forward_config(combine_format=public_format)) as op:
-        kernel_config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
+        kernel_config = Mxfp8KernelConfig.from_operator_config(op._forward_config)
 
     assert kernel_config.combine_format == wire_format
 
@@ -482,11 +513,39 @@ def test_moe_ep_rejects_interleaved_plain_fc1_weight():
 
 
 @pytest.mark.L0
-def test_moe_ep_rejects_untyped_tuning():
+@pytest.mark.parametrize("name", ("tuning", "forward_tuning", "backward_tuning"))
+def test_moe_ep_rejects_untyped_tuning(name):
     from cudnn import MoeEp
 
     with pytest.raises(TypeError, match="MoeEpTuningConfig"):
-        MoeEp(**_forward_config(), tuning={"group_hint": 768})
+        MoeEp(**_forward_config(), **{name: {"group_hint": 768}})
+
+
+@pytest.mark.L0
+def test_moe_ep_rejects_conflicting_forward_tuning_aliases():
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    with pytest.raises(ValueError, match="aliases"):
+        MoeEp(
+            **_forward_config(),
+            tuning=MoeEpTuningConfig(),
+            forward_tuning=MoeEpTuningConfig(),
+        )
+
+
+@pytest.mark.L0
+def test_moe_ep_backward_tuning_default_is_independent():
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    forward_tuning = MoeEpTuningConfig(
+        token_back_mode="standalone_warps",
+        epi_flag_batch=(4, 2),
+        token_in_flag_batch=8,
+        group_hint=768,
+    )
+    with MoeEp(**_forward_config(), forward_tuning=forward_tuning) as op:
+        assert op.forward_tuning is forward_tuning
+        assert op.backward_tuning == MoeEpTuningConfig()
 
 
 @pytest.mark.L0
@@ -1054,12 +1113,8 @@ def test_activation_scale_rows_are_padded_to_16_bytes():
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(
-        region
-        for region in requirements.symmetric_regions
-        if region.name == "activation_scale"
-    )
-    assert activation_scale.nbytes == 5 * 16
+    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
+    assert activation_scale.nbytes == 128 * 16
 
 
 @pytest.mark.L0
@@ -1294,7 +1349,7 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
         )
 
     validate_config(config)
-    kernel_config = Mxfp8KernelConfig.from_forward_config(config)
+    kernel_config = Mxfp8KernelConfig.from_operator_config(config)
     assert kernel_config.world_size == 32
     assert kernel_config.local_rank == 31
 
