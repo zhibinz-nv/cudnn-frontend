@@ -18,13 +18,14 @@ from moe_ep.moe_ep_test_support import (
     _assert_matches_reference,
     _assert_wgrads_match_reference,
     _dense_wgrads_from_grouped_kernel,
-    _dense_wgrads_from_operands,
     _fixed_training_reference,
     _fixed_training_weights,
     _forward_config,
     _grad_output,
     _interleave_fc1_wgrad,
     _output_as_float,
+    _pad_wgrad_operands_for_grouped_kernel,
+    _poison_training_outputs_for_test,
     _reference_forward,
     make_distributed_forward_inputs,
     quantize_mxfp8,
@@ -363,6 +364,7 @@ def _run_backward_reference_case(
             requirements,
             device,
         )
+        _poison_training_outputs_for_test(forward_out, backward_out)
         actual_y = op.training_forward(
             lane,
             args[0],
@@ -384,7 +386,8 @@ def _run_backward_reference_case(
             expert_offsets=forward_out.expert_offsets,
             out=backward_out,
         )
-        grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
+        padded_wgrads = _pad_wgrad_operands_for_grouped_kernel(actual_wgrads)
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(padded_wgrads)
         torch.cuda.synchronize(device)
 
         # No rank may enter a local assertion while a peer is still inside a
@@ -433,14 +436,6 @@ def _run_backward_reference_case(
                 expected_dense_wgrads,
                 reference_name="the independent PyTorch MXFP8 reference",
             )
-            _assert_grouped_wgrads_match_reference(
-                grouped_wgrads,
-                _dense_wgrads_from_operands(actual_wgrads),
-                reference_name="the decoded production operand bundle",
-                close_kwargs={"rtol": 0.1, "atol": 0.1},
-            )
-            assert grouped_wgrads[0][1].eq(0).all()
-            assert grouped_wgrads[1][1].eq(0).all()
         except BaseException as error:
             assertion_error = error
         dist.barrier(group=ep_group)

@@ -133,8 +133,10 @@ grad_activation, dprob, wgrad_operands = op.training_backward(
 )
 ```
 
-The WGrad result is a fixed-capacity grouped-GEMM operand bundle, not dense
-optimizer-ready weight gradients. See the detailed
+The WGrad result is a fixed-capacity operand bundle, not dense optimizer-ready
+weight gradients. Only the expert rows identified jointly by
+`expert_offsets` and `valid_route_counts` are defined; padded rows and the
+remaining capacity tail are unspecified. See the detailed
 [MoE + Expert Parallel API](../fe-oss-apis/moe_ep.md) reference for
 installation, all constructor arguments, native layouts, buffer ownership,
 overflow handling, and CUDA Graph requirements. MoeEP is

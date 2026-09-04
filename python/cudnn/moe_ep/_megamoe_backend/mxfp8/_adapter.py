@@ -399,6 +399,8 @@ class Mxfp8InputAdapter:
         *,
         local_workspace_zero_bytes: int,
         shared_workspace_zero_bytes: int,
+        accepted_route_validity_offset: int | None,
+        accepted_route_validity_elements: int,
         pre_reduced_activation_offset: int | None,
         pre_reduced_activation_bytes_per_token: int,
         pre_reduced_activation_sf_offset: int | None,
@@ -486,20 +488,12 @@ class Mxfp8InputAdapter:
         shared_workspace = symmetric["kernel_shared_workspace"]
 
         staged_activation = _as_mxfp8(request.activation)
-        _as_bytes(activation).zero_()
         _as_bytes(activation[:token_count]).copy_(_as_bytes(staged_activation.data))
-        _as_bytes(activation_sf).zero_()
         _as_bytes(activation_sf[:token_count, :hidden_sf_columns]).copy_(_as_bytes(staged_activation.scale))
         _validate_int32_downcast(request.topk_idx)
         topk_indices.fill_(-1)
         topk_indices[:token_count].copy_(request.topk_idx)
-        topk_weights.zero_()
         topk_weights[:token_count].copy_(request.topk_weights)
-        _as_bytes(output_data).zero_()
-        if col_quant_data is not None:
-            local["col_quant_data"].zero_()
-        if col_quant_sf is not None:
-            col_quant_sf.zero_()
         overflow_flag.zero_()
         workspace_key = (
             local_workspace.data_ptr(),
@@ -523,36 +517,32 @@ class Mxfp8InputAdapter:
             self._initialized_workspace_key = workspace_key
         if config.fc2_in_kernel_topk_reduce:
             if (
-                pre_reduced_activation_offset is not None
+                accepted_route_validity_offset is not None
+                or accepted_route_validity_elements != 0
+                or pre_reduced_activation_offset is not None
                 or pre_reduced_activation_bytes_per_token != 0
                 or pre_reduced_activation_sf_offset is not None
                 or pre_reduced_activation_sf_bytes_per_token != 0
             ):
-                raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
-            # output_data is the in-kernel REDG accumulation base and was
-            # cleared above.
+                raise ValueError("in-kernel top-k reduction must not receive standalone " "combine validity or pre-reduced workspaces")
         else:
+            if accepted_route_validity_offset is None or accepted_route_validity_elements <= 0:
+                raise ValueError("standalone top-k reduction requires an accepted-route validity table")
+            _zero_workspace_range(
+                local_workspace,
+                accepted_route_validity_offset,
+                accepted_route_validity_elements * 4,
+                name="accepted-route validity table",
+            )
             if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
                 raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
-            # The kernel writes only valid routes into this persistent combine
-            # plane. Clear the active token rows so dropped routes cannot reuse
-            # contributions from a previous launch.
-            _zero_workspace_range(
-                shared_workspace,
-                pre_reduced_activation_offset,
-                token_count * pre_reduced_activation_bytes_per_token,
-                name="pre-reduced activation workspace",
-            )
+            # The persistent data/scale planes are intentionally not cleared.
+            # Router acceptance marks exactly which source slots TopkReduce may
+            # consume during this launch.
             quantized_combine = config.combine_format != "bf16"
             if quantized_combine:
                 if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:
                     raise ValueError("quantized standalone top-k reduction requires a " "pre-reduced scale workspace")
-                _zero_workspace_range(
-                    shared_workspace,
-                    pre_reduced_activation_sf_offset,
-                    token_count * pre_reduced_activation_sf_bytes_per_token,
-                    name="pre-reduced activation scale workspace",
-                )
             elif pre_reduced_activation_sf_offset is not None or pre_reduced_activation_sf_bytes_per_token != 0:
                 raise ValueError("BF16 standalone top-k reduction must not receive a " "pre-reduced scale workspace")
 

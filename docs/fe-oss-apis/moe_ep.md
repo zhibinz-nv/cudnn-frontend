@@ -255,11 +255,8 @@ explicitly because cuDNN does not retain the forward output bundle.
 
 All six backward WGrad fields are required. `operands` is always a
 `MoeEpTrainingWgradOperands` containing non-owning views of the exact caller
-buffers.
-
-The producer-native ABI is directly consumable by the separately invoked
-grouped WGrad kernel. Here `K_pool` is the fixed routed-token pool capacity,
-not the model's top-k value:
+buffers. Here `K_pool` is the fixed routed-token pool capacity, not the
+model's top-k value:
 
 - `fc1_b` remains gate/up-interleaved with shape `(K_pool, 2I)` and stride
   `(2I, 1)`;
@@ -268,6 +265,20 @@ not the model's top-k value:
   interleaved layout;
 - no public compact scale, deinterleave copy, physical transpose, slot export,
   or scale-expansion kernel is used.
+
+The fixed tensor extent is storage capacity, not a promise that every row is
+defined. For local expert `e`, let `begin` be zero when `e == 0` and
+`expert_offsets[e - 1]` otherwise. Only
+`[begin, begin + valid_route_counts[e])` is valid. The remainder of that
+expert's padded segment and the capacity tail after `expert_offsets[-1]` have
+unspecified data and scale values. Consumers must use both metadata tensors:
+`expert_offsets` locates each physical segment and `valid_route_counts`
+limits the rows read from it.
+
+The existing grouped WGrad API derives its GEMM K extent from adjacent
+`expert_offsets` and therefore reads complete padded segments. MoeEP operands
+are not guaranteed to be directly consumable by that API under this validity
+contract.
 
 ## Ownership and lifetime
 
@@ -278,7 +289,7 @@ not the model's top-k value:
 - TE must provide `fc1_preact` to forward and keep it live through the matching
   backward; cuDNN has no private preactivation fallback or workspace alias.
 - Forward WGrad outputs, segment metadata, and backward WGrad outputs remain
-  live until the independent grouped WGrad consumer completes.
+  live until the independent WGrad consumer completes.
 - cuDNN owns private per-lane local and NVSHMEM symmetric scratch.
 - One lane may be active on only one stream at a time.
 - All EP ranks must submit distributed forward/backward calls in identical
@@ -306,8 +317,11 @@ make the policy rank-consistent.
 6. Keep all captured input, output, saved-state, staging, and native-pack
    addresses stable until every referencing graph executable is destroyed.
 
-Dynamic contents may change at fixed addresses. Eager invocations may replace
-addresses between calls.
+The local token count `T` is fixed by the input shapes used during capture.
+Every replay of that graph must use the same `T`, shapes, and addresses.
+Tensor contents, routing, `valid_route_counts`, and `expert_offsets` may change
+at those fixed addresses on each replay. Eager invocations may use a different
+`T` and replace addresses between calls, subject to the configured capacity.
 
 ## Breaking migration
 

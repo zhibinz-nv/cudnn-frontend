@@ -429,6 +429,7 @@ def validate_training_input(
     topk_weights: torch.Tensor,
     *,
     device: torch.device,
+    validate_expert_ids: bool = True,
 ) -> int:
     logical_shape = _logical_shape(value)
     if len(logical_shape) != 2 or logical_shape[1] != config.hidden_size:
@@ -454,7 +455,7 @@ def validate_training_input(
         token_count,
         topk_idx,
         topk_weights,
-        validate_expert_ids=not capturing,
+        validate_expert_ids=validate_expert_ids and not capturing,
     )
     if topk_idx.dtype is not torch.int32 or not topk_idx.is_contiguous():
         raise TypeError("training topk_idx must be contiguous torch.int32")

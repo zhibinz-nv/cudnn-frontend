@@ -40,24 +40,16 @@ from ._training_weights import (
 from ._training_wgrad import assemble_training_wgrad_operands
 
 
-def _zero_pre_reduced(inputs, prepared) -> None:
-    capacity = prepared.config.max_tokens_per_rank
-    offset = prepared.pre_reduced_activation_offset
-    bytes_per_token = prepared.pre_reduced_activation_bytes_per_token
-    if offset is not None and bytes_per_token:
-        inputs.shared_workspace.narrow(
-            0,
-            offset,
-            capacity * bytes_per_token,
-        ).zero_()
-    sf_offset = prepared.pre_reduced_activation_sf_offset
-    sf_bytes_per_token = prepared.pre_reduced_activation_sf_bytes_per_token
-    if sf_offset is not None and sf_bytes_per_token:
-        inputs.shared_workspace.narrow(
-            0,
-            sf_offset,
-            capacity * sf_bytes_per_token,
-        ).zero_()
+def _zero_accepted_route_validity(inputs, prepared) -> None:
+    offset = prepared.accepted_route_validity_offset
+    elements = prepared.accepted_route_validity_elements
+    if offset is None:
+        if elements != 0:
+            raise ValueError("missing validity-table offset for nonzero element count")
+        return
+    if elements <= 0:
+        raise ValueError("validity-table element count must be positive")
+    inputs.local_workspace.narrow(0, offset, elements * 4).zero_()
 
 
 def _activation_views(
@@ -108,10 +100,7 @@ def _stage_input(
 
     token_count = int(value.logical_shape[0])
     scale_columns = int(value.scale.shape[1])
-    activation_data.zero_()
-    activation_sf.zero_()
     routing_topk_idx.fill_(-1)
-    routing_topk_weights.zero_()
     if token_count == 0:
         return
     activation_data[:token_count].copy_(value.data)
@@ -189,12 +178,7 @@ def launch_training_forward(
     valid_route_counts = out.valid_route_counts
     expert_offsets = out.expert_offsets
 
-    scratch.forward_output.zero_()
     scratch.forward_overflow.zero_()
-    col_quant_data.zero_()
-    # E8M0 byte 127 encodes scale 1.0. The producer only overwrites active
-    # expert segments, so the unused grouped-WGrad capacity must stay neutral.
-    col_quant_sf.fill_(127)
     _runtime_debug("training-forward.reset.end", lane=scratch.index)
 
     workspace = execution.forward.workspace
@@ -213,7 +197,7 @@ def launch_training_forward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _zero_pre_reduced(inputs, prepared)
+    _zero_accepted_route_validity(inputs, prepared)
     _runtime_debug("training-forward.compile.begin", lane=scratch.index)
     compiled = compile_or_get(
         prepared,
@@ -309,15 +293,8 @@ def launch_training_backward(
     grad_y2 = out.fc2_b
     grad_y2_sf = out.fc2_sfb.view(torch.uint8).reshape(-1)
 
-    scratch.backward_output.zero_()
     scratch.backward_overflow.zero_()
     scratch.dprob.zero_()
-    fc1_recompute.zero_()
-    fc1_recompute_sf.view(torch.uint8).fill_(127)
-    fc1_col_output.zero_()
-    fc1_col_output_sf.view(torch.uint8).fill_(127)
-    grad_y2.zero_()
-    grad_y2_sf.fill_(127)
     _runtime_debug("training-backward.reset.end", lane=scratch.index)
 
     workspace = execution.backward.workspace
@@ -346,7 +323,7 @@ def launch_training_backward(
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
-    _zero_pre_reduced(inputs, prepared)
+    _zero_accepted_route_validity(inputs, prepared)
     _runtime_debug("training-backward.compile.begin", lane=scratch.index)
     compiled = compile_backward_or_get(
         prepared,

@@ -319,6 +319,72 @@ def test_in_kernel_topk_reduce_omits_standalone_combine_workspace():
 
 
 @pytest.mark.L0
+def test_standalone_topk_reduce_tracks_uint32_accepted_routes():
+    import cutlass
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._compile import (
+        _accepted_route_validity_workspace_metadata,
+    )
+
+    class NoValidityWorkspace:
+        def region(self, _name):
+            raise AssertionError("in-kernel reduction must not query validity")
+
+    config = SimpleNamespace(
+        fc2_in_kernel_topk_reduce=True,
+        max_tokens_per_rank=5,
+        top_k=3,
+    )
+    assert _accepted_route_validity_workspace_metadata(
+        NoValidityWorkspace(),
+        config,
+        local_bytes=0,
+    ) == (None, 0)
+
+    elements = config.max_tokens_per_rank * config.top_k
+
+    class StandaloneWorkspace:
+        def region(self, _name):
+            return SimpleNamespace(
+                buffer_space="local",
+                dtype=cutlass.Uint32,
+            )
+
+        def offset(self, _name):
+            return 64
+
+        def nbytes(self, _name):
+            return elements * 4
+
+    config.fc2_in_kernel_topk_reduce = False
+    assert _accepted_route_validity_workspace_metadata(
+        StandaloneWorkspace(),
+        config,
+        local_bytes=64 + elements * 4,
+    ) == (64, elements)
+
+
+@pytest.mark.L0
+def test_training_reset_clears_only_accepted_route_validity():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._training_execute import (
+        _zero_accepted_route_validity,
+    )
+
+    workspace = torch.full((96,), 0xA5, dtype=torch.uint8)
+    inputs = SimpleNamespace(local_workspace=workspace)
+    prepared = SimpleNamespace(
+        accepted_route_validity_offset=16,
+        accepted_route_validity_elements=8,
+    )
+
+    _zero_accepted_route_validity(inputs, prepared)
+
+    assert workspace[:16].eq(0xA5).all()
+    assert workspace[16:48].eq(0).all()
+    assert workspace[48:].eq(0xA5).all()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     ("combine_format", "bits_per_element"),
     [
@@ -431,6 +497,30 @@ def test_moe_ep_rejects_invalid_padding(kwargs):
 
     with pytest.raises(ValueError):
         MoeEp(**_forward_config(), **kwargs)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("validation_mode", ["strict", "trusted"])
+def test_moe_ep_accepts_validation_modes(validation_mode):
+    from cudnn import MoeEp
+
+    with MoeEp(
+        **_forward_config(),
+        validation_mode=validation_mode,
+    ) as op:
+        assert op.validation_mode == validation_mode
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("validation_mode", [None, True, "fast"])
+def test_moe_ep_rejects_invalid_validation_mode(validation_mode):
+    from cudnn import MoeEp
+
+    with pytest.raises(ValueError, match="validation_mode"):
+        MoeEp(
+            **_forward_config(),
+            validation_mode=validation_mode,
+        )
 
 
 @pytest.mark.L0
@@ -873,14 +963,15 @@ def test_supported_topk_shape_and_routing_format_matrix(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_single_gpu_stress_and_cuda_graph_replay():
+@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
+def test_single_gpu_stress_and_cuda_graph_replay(combine_format):
     from cudnn import MoeEp
 
     device = _sm107_device()
     args = make_forward_inputs(device)
     original_topk_idx = args[3].clone()
     original_topk_weights = args[4].clone()
-    config = _forward_config()
+    config = _forward_config(combine_format=combine_format)
     expected = _reference_forward(args, **config)
 
     with MoeEp(**config) as op:
